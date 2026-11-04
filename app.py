@@ -31,7 +31,9 @@ from streamlit_calendar import calendar
 MODEL = "gpt-6-luna"
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 KST = timezone(timedelta(hours=9))
-VOICE_TIMEOUT_SECONDS = 20  # 음성 연결/생성 전체 대기 제한
+VOICE_TIMEOUT_SECONDS = 30  # 전체 답변 낭독 제한. 넘으면 낭독용 요약으로 다시 읽음
+VOICE_SUMMARY_TEXT_TIMEOUT_SECONDS = 10  # 낭독용 요약 문장 생성 제한
+VOICE_SUMMARY_TIMEOUT_SECONDS = 15  # 낭독용 요약 음성 생성 제한
 MAX_AUDIO_ITEMS = 10
 MAX_AUDIO_BYTES = 30 * 1024 * 1024  # 최근 음성 총 30MB, 오래된 음성부터 정리
 MAX_MAIL_HISTORY = 20
@@ -241,6 +243,14 @@ events에는 김 대리에게 최종 배정된 업무만 넣습니다.
 """
 
 VOICE_INSTRUCTIONS = """사용자가 준 문장을 바꾸거나 덧붙이지 말고 그대로 읽습니다."""
+
+# 전체 답변 낭독이 VOICE_TIMEOUT_SECONDS를 넘을 때만 사용합니다. 화면의 텍스트 답변은 바꾸지 않습니다.
+VOICE_SUMMARY_INSTRUCTIONS = """아래 답변을 음성으로 읽을 2~3문장(약 150자 이내)으로 줄입니다.
+- 답변에 있는 사실만 사용하고 새로운 업무, 날짜, 담당자를 만들지 않습니다.
+- 업무 개수, 가장 가까운 마감일, 사용자가 해야 할 확인(예: 메일 발송 버튼)을 우선합니다.
+- 마크다운, 목록 기호, 이모지 없이 자연스러운 한국어 구어체로 씁니다.
+- 날짜는 '11월 18일', 시각은 '오후 3시'처럼 읽기 쉽게 씁니다.
+- 요약한 문장만 출력합니다."""
 
 
 # ========================================================================
@@ -601,7 +611,7 @@ def checkpoint_current_meeting():
         'summary':st.session_state.summary,
         'events':copy.deepcopy(st.session_state.events),
         'tasks':copy.deepcopy([t for t in st.session_state.tasks if t.get('source')=='meeting' and t.get('meeting_id')==identity]),
-        'messages':[{key:m[key] for key in ('role','content','message_id','audio_id') if key in m} for m in st.session_state.messages[-MAX_TURNS*2:]],
+        'messages':[{key:m[key] for key in ('role','content','message_id','audio_id','voice_mode','voice_text') if key in m} for m in st.session_state.messages[-MAX_TURNS*2:]],
         'analyzed_meeting_id':st.session_state.get('analyzed_meeting_id',''),
     }
 
@@ -1186,9 +1196,26 @@ async def _live_speak_impl(text):
     return pcm_to_wav(bytes(spoken))
 
 
-async def live_speak(text):
+async def live_speak(text, timeout=VOICE_TIMEOUT_SECONDS):
     """연결 시작부터 음성 수신 완료까지 전체에 제한 시간을 적용합니다."""
-    return await asyncio.wait_for(_live_speak_impl(text), timeout=VOICE_TIMEOUT_SECONDS)
+    return await asyncio.wait_for(_live_speak_impl(text), timeout=timeout)
+
+
+def speech_text(text):
+    """화면용 마크다운 기호(**, #, 목록 기호, 링크)를 낭독용 일반 문장으로 정리합니다."""
+    text=re.sub(r'\[([^\]]+)\]\([^)]+\)',r'\1',text or '')
+    text=re.sub(r'[*_`#>]+','',text)
+    text=re.sub(r'^\s*(?:[-•]|\d+\.)\s+','',text,flags=re.M)
+    return re.sub(r'\n{2,}','\n',text).strip()
+
+
+def voice_summary(text):
+    """긴 답변을 낭독용 2~3문장으로 줄입니다. 답변에 없는 사실은 추가하지 않습니다."""
+    response=client.with_options(timeout=VOICE_SUMMARY_TEXT_TIMEOUT_SECONDS).responses.create(
+        model=MODEL,instructions=VOICE_SUMMARY_INSTRUCTIONS,input=text)
+    short=speech_text(response.output_text or '')
+    if not short:raise RuntimeError('낭독용 요약이 비어 있습니다.')
+    return short
 
 
 
@@ -1216,15 +1243,32 @@ def render_voice():
 
 
 def speak_message(message):
-    """음성 생성 전체에 제한 시간을 적용합니다. 실패해도 텍스트는 유지합니다."""
+    """전체 답변을 먼저 읽고, 제한 시간을 넘기면 낭독용 요약으로 한 번 더 시도합니다.
+    텍스트 답변은 항상 그대로 유지합니다. voice_mode: full(전체) / summary(요약) / failed."""
+    full=speech_text(message['content'])
     try:
-        wav=asyncio.run(live_speak(message['content']))
+        wav=asyncio.run(live_speak(full,VOICE_TIMEOUT_SECONDS))
         cache_answer_audio(message,wav)
+        message.update(voice_mode='full');message.pop('voice_text',None)
         return True
     except (TimeoutError, asyncio.TimeoutError):
-        st.session_state.voice_error=f'음성 응답이 {VOICE_TIMEOUT_SECONDS}초 내에 완료되지 않아 중단했습니다. 텍스트 답변은 유지됩니다.'
+        pass  # 긴 답변입니다. 아래에서 요약본으로 다시 읽습니다.
     except Exception:
+        # 키·연결 문제는 요약해도 같은 결과이므로 재시도하지 않습니다.
+        message['voice_mode']='failed'
         st.session_state.voice_error='음성 생성에 실패했습니다. 텍스트 답변은 유지됩니다.'
+        return False
+    try:
+        short=voice_summary(full)
+        wav=asyncio.run(live_speak(short,VOICE_SUMMARY_TIMEOUT_SECONDS))
+        cache_answer_audio(message,wav)
+        message.update(voice_mode='summary',voice_text=short)
+        return True
+    except (TimeoutError, asyncio.TimeoutError):
+        st.session_state.voice_error=f'답변이 길어 요약본으로 다시 읽으려 했지만 {VOICE_SUMMARY_TIMEOUT_SECONDS}초 안에 완료되지 않았습니다. 텍스트 답변은 유지됩니다.'
+    except Exception:
+        st.session_state.voice_error='답변이 길어 요약본으로 다시 읽으려 했지만 실패했습니다. 텍스트 답변은 유지됩니다.'
+    message['voice_mode']='failed'
     return False
 
 
@@ -1300,7 +1344,7 @@ def run_request(request_text, audio_value):
         if transcript.text.strip():parts.append(transcript.text.strip())
     if not parts:
         st.warning('음성이나 텍스트로 요청하세요.');return
-    with st.spinner('답변과 음성을 준비하고 있습니다...'):
+    with st.spinner(f'답변과 음성을 준비하고 있습니다... 긴 답변은 {VOICE_TIMEOUT_SECONDS}초 뒤 요약본으로 읽습니다.'):
         ask_assistant('\n'.join(parts))
         message=st.session_state.messages[-1]
         message.setdefault('message_id',uuid.uuid4().hex)
@@ -1345,7 +1389,7 @@ def run_briefing():
         st.session_state.messages=st.session_state.messages[-MAX_TURNS*2:]
         # 텍스트를 먼저 표시하고, 스피너와 함께 제한 시간 안에서만 음성을 생성합니다.
         st.info(message['content'])
-        with st.spinner(f'업무 브리핑 음성을 준비합니다. 최대 {VOICE_TIMEOUT_SECONDS}초...'):
+        with st.spinner(f'업무 브리핑 음성을 준비합니다. {VOICE_TIMEOUT_SECONDS}초가 넘으면 요약본으로 읽습니다...'):
             speak_message(message)
         checkpoint_current_meeting()
     finally:
@@ -1450,6 +1494,8 @@ def render_chat(placeholder):
             st.write(message['content'])
             audio_id=message.get('audio_id')
             if audio_id and audio_id in st.session_state.audio_vault:
+                if message.get('voice_mode')=='summary':
+                    st.caption('🔊 답변이 길어 음성은 요약본으로 읽었습니다: '+message.get('voice_text',''))
                 if st.button('이 답변 다시 듣기',key='relisten_'+message['message_id']):
                     st.session_state.active_audio_id=audio_id
                     st.session_state.autoplay_audio_id=audio_id
