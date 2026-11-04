@@ -31,6 +31,7 @@ from streamlit_calendar import calendar
 MODEL = "gpt-6-luna"
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 KST = timezone(timedelta(hours=9))
+VOICE_TIMEOUT_SECONDS = 20  # 음성 연결/생성 전체 대기 제한
 MAX_AUDIO_ITEMS = 10
 MAX_AUDIO_BYTES = 30 * 1024 * 1024  # 최근 음성 총 30MB, 오래된 음성부터 정리
 MAX_MAIL_HISTORY = 20
@@ -751,22 +752,30 @@ def summarize_meeting():
 
 # GOOGLE_TOKEN 또는 기존 token.json을 읽고 필요하면 access token을 갱신합니다.
 def load_google_credentials():
-    info = None
-    raw = os.getenv("GOOGLE_TOKEN", "").strip()
-    if raw:
-        try:
-            info = json.loads(raw)
-        except json.JSONDecodeError:
-            info = None
-    if not info and os.path.exists("token.json"):
-        with open("token.json", encoding="utf-8") as f:
-            info = json.load(f)
-    if not info:
-        raise RuntimeError("token.json 또는 GOOGLE_TOKEN 비밀값이 없습니다.")
-    creds = Credentials.from_authorized_user_info(info, SCOPES)
-    if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
+    raw=os.getenv('GOOGLE_TOKEN','').strip()
+    try:
+        if raw:info=json.loads(raw)
+        elif os.path.exists('token.json'):
+            with open('token.json',encoding='utf-8') as file:info=json.load(file)
+        else:raise CalendarConfigError('Streamlit Secrets에 GOOGLE_TOKEN이 없습니다.')
+    except (json.JSONDecodeError,UnicodeError):
+        raise CalendarConfigError('GOOGLE_TOKEN은 token.json 전체 JSON이어야 합니다. Secrets의 삼중 따옴표와 JSON 형식을 확인하세요.') from None
+    if not isinstance(info,dict):raise CalendarConfigError('GOOGLE_TOKEN 형식은 JSON 객체여야 합니다.')
+    if any(not info.get(k) for k in ('refresh_token','client_id','client_secret')):
+        raise CalendarConfigError('GOOGLE_TOKEN에 필수 인증 항목이 없습니다. 03 토큰 발급 노트북에서 다시 발급하세요.')
+    try:
+        creds=Credentials.from_authorized_user_info(info,SCOPES)
+    except Exception:
+        raise CalendarConfigError('GOOGLE_TOKEN의 인증 항목을 읽지 못했습니다. 전체 token.json을 다시 등록하세요.') from None
+    if not creds.valid and creds.refresh_token:
+        transport=Request()
+        def timed_request(*args,**kwargs):
+            kwargs['timeout']=20
+            return transport(*args,**kwargs)
+        creds.refresh(timed_request)
+    if not creds.valid:raise CalendarConfigError('Google 인증이 유효하지 않습니다. 03에서 재발급 후 Streamlit Secrets를 교체하세요.')
     return creds
+
 
 
 # Google Calendar API 연결 객체를 만듭니다. 여기서는 일정을 생성하지 않습니다.
@@ -851,21 +860,27 @@ def event_dates(event, meeting_date=''):
 
 # 분석 결과의 시작·종료 시각을 꺼냅니다. 상태를 변경하지 않습니다.
 def clock_text(event):
-    if not event.get('has_clock_time'):
-        return '', ''
-    start = (event.get('start_time') or '').strip()
-    end = (event.get('end_time') or '').strip()
+    """HH:MM, HH:MM:SS, 오후 3시 등 실제로 제공된 시각을 정규화합니다."""
+    start=(event.get('start_time') or '').strip()
+    end=(event.get('end_time') or '').strip()
     if not start:
-        raise ValueError('시각이 있는 일정에는 시작 시각이 필요합니다.')
-    for value in (start, end):
-        if value:
-            try:
-                parsed = datetime.strptime(value, '%H:%M')
-                if parsed.strftime('%H:%M') != value:
-                    raise ValueError()
-            except ValueError:
-                raise ValueError('시각은 00:00~23:59 범위의 HH:MM 형식이어야 합니다.') from None
-    return start, end
+        match=re.search(r'(?:오전|오후)\s*\d{1,2}(?:시|:\d{2})(?:\s*\d{1,2}분)?|(?<!\d)\d{1,2}:\d{2}(?::\d{2})?',event.get('due_text') or '')
+        if match:start=match.group(0)
+    if not start and not event.get('has_clock_time'):return '', ''
+    if not start:raise ValueError('시각이 있는 일정에는 시작 시각이 필요합니다.')
+    def normalize(value):
+        if not value:return ''
+        value=re.sub(r'\s+','',value)
+        match=re.fullmatch(r'(오전|오후)?(\d{1,2})(?::(\d{2})(?::00)?|시(?:(\d{1,2})분)?)',value)
+        if not match:raise ValueError('시각은 HH:MM 또는 오전/오후 N시 형식으로 입력하세요.')
+        ampm,hour,minute,korean_minute=match.groups();hour=int(hour);minute=int(minute or korean_minute or 0)
+        if ampm:
+            if not 1<=hour<=12:raise ValueError('오전/오후 시각은 1~12시 범위여야 합니다.')
+            hour=hour%12+(12 if ampm=='오후' else 0)
+        if not 0<=hour<24 or not 0<=minute<60:raise ValueError('시각은 00:00~23:59 범위여야 합니다.')
+        return f'{hour:02d}:{minute:02d}'
+    return normalize(start), normalize(end)
+
 
 
 
@@ -881,7 +896,7 @@ def google_time_body(start_date, start_time, end_time, end_date=''):
     except (ValueError, TypeError):
         raise ValueError('올바른 시작 날짜가 필요합니다.') from None
     if start_time:
-        clock_text({'has_clock_time':True,'start_time':start_time,'end_time':end_time})
+        start_time,end_time=clock_text({'has_clock_time':True,'start_time':start_time,'end_time':end_time})
         start = datetime.fromisoformat(f'{start_date}T{start_time}').replace(tzinfo=KST)
         if end_time:
             end_day = date.fromisoformat(end_date) if end_date else start_day
@@ -922,29 +937,50 @@ def calendar_body(task):
     return body
 
 
-def persist_google_task(task):
-    """안정적인 Google ID로 중복 생성을 방지합니다. 재시작 후 재등록도 같은 ID를 사용합니다."""
-    body = calendar_body(task)
-    signature = hashlib.sha256(json.dumps(body,sort_keys=True).encode('utf-8')).hexdigest()
-    if task.get('sync_status') == 'synced' and task.get('synced_signature') == signature:
+def persist_google_task(task, force=False):
+    """강제 확인은 메모리 상태를 믿지 않고 Google의 실제 일정 존재/삭제 상태를 읽습니다."""
+    body=calendar_body(task)
+    signature=hashlib.sha256(json.dumps(body,sort_keys=True).encode('utf-8')).hexdigest()
+    if not force and task.get('sync_status')=='synced' and task.get('synced_signature')==signature:
         return {'status':'unchanged','summary':task['title'],'event_id':task['event_id']}
-    service = get_calendar_service()
-    event_id = task.get('event_id') or 'a' + task['task_id']
+    service=get_calendar_service()
+    event_id=task.get('event_id') or 'a'+task['task_id']
+    exists=bool(task.get('event_id'))
+    if force and exists:
+        try:
+            existing=service.events().get(calendarId='primary',eventId=event_id).execute()
+            if existing.get('status')=='cancelled':
+                event_id='a'+uuid.uuid4().hex;exists=False
+        except Exception as error:
+            if getattr(getattr(error,'resp',None),'status',None) in (404,410):
+                event_id='a'+uuid.uuid4().hex;exists=False
+            else:raise
     try:
-        if task.get('event_id'):
-            service.events().patch(calendarId='primary',eventId=event_id,body=body).execute()
+        if exists:
+            # 이전 일정 유형의 date/dateTime 필드가 남지 않도록 명시적으로 제거합니다.
+            patched=copy.deepcopy(body)
+            for key in ('start','end'):
+                patched[key]['date' if 'dateTime' in patched[key] else 'dateTime']=None
+            saved=service.events().patch(calendarId='primary',eventId=event_id,body=patched).execute()
         else:
-            service.events().insert(calendarId='primary',body=dict(body,id=event_id)).execute()
+            saved=service.events().insert(calendarId='primary',body=dict(body,id=event_id)).execute()
     except Exception as error:
-        status = getattr(getattr(error,'resp',None),'status',None)
-        if status == 409:  # 같은 ID가 이미 있으면 추가하지 않고 해당 일정을 수정합니다.
-            service.events().patch(calendarId='primary',eventId=event_id,body=body).execute()
-        elif status == 404 and task.get('event_id'):
-            service.events().insert(calendarId='primary',body=dict(body,id=event_id)).execute()
-        else:
-            raise
-    task.update(event_id=event_id,sync_status='synced',synced_signature=signature)
-    return {'status':'success','summary':task['title'],'event_id':event_id}
+        code=getattr(getattr(error,'resp',None),'status',None)
+        if code==409:
+            existing=service.events().get(calendarId='primary',eventId=event_id).execute()
+            if existing.get('status')=='cancelled':
+                event_id='a'+uuid.uuid4().hex
+                saved=service.events().insert(calendarId='primary',body=dict(body,id=event_id)).execute()
+            else:saved=service.events().patch(calendarId='primary',eventId=event_id,body=body).execute()
+        elif code in (404,410) and exists:
+            event_id='a'+uuid.uuid4().hex
+            saved=service.events().insert(calendarId='primary',body=dict(body,id=event_id)).execute()
+        else:raise
+    if saved.get('status')=='cancelled':raise CalendarConfigError('Google 일정이 삭제 상태입니다. 다시 확인·반영을 실행하세요.')
+    task.update(event_id=event_id,sync_status='synced',synced_signature=signature,
+                google_event_url=saved.get('htmlLink',''),last_synced_at=datetime.now(KST).isoformat())
+    return {'status':'success','summary':task['title'],'event_id':event_id,'html_link':task['google_event_url']}
+
 
 
 def sync_calendar_tasks(force=False):
@@ -953,7 +989,7 @@ def sync_calendar_tasks(force=False):
     attempted = False
     for task in st.session_state.tasks:
         if task.get('sync_paused') or task.get('trashed') or task.get('done') or not task.get('deadline'):
-            skipped.append({'summary':task['title'],'reason':'휴지통·완료 업무이거나 확정 날짜가 없습니다.'})
+            skipped.append({'summary':task['title'],'reason':'복원 후 연동 보류' if task.get('sync_paused') else '휴지통·완료 업무이거나 확정 날짜가 없습니다.'})
             continue
         fields = {key:task.get(key,'') for key in ('title','description','due_text','deadline','start_time','end_time','end_date')}
         signature = hashlib.sha256(json.dumps(fields,sort_keys=True).encode('utf-8')).hexdigest()
@@ -964,12 +1000,12 @@ def sync_calendar_tasks(force=False):
         attempted = True
         task['auto_attempt_signature'] = signature
         try:
-            result = persist_google_task(task)
+            result = persist_google_task(task, force=force)
             task.pop('sync_error',None)
             (unchanged if result['status']=='unchanged' else registered).append(result)
-        except Exception:
+        except Exception as error:
             task['sync_status'] = 'failed'
-            task['sync_error'] = 'Google 연동 실패: 인증정보와 날짜를 확인한 뒤 재시도하세요.'
+            task['sync_error'] = calendar_error_message(error)
             failed.append({'summary':task['title'],'reason':task['sync_error']})
     refresh_app_calendar()
     status = 'partial_success' if failed and (registered or unchanged) else 'failed' if failed else 'success' if (registered or unchanged) else 'no_action'
@@ -1046,6 +1082,36 @@ def confirm_email(draft_id, recipient, subject, body):
     return result
 
 
+class CalendarConfigError(RuntimeError):
+    """비밀정보 없이 사용자에게 표시할 수 있는 설정 오류입니다."""
+
+
+def calendar_error_message(error):
+    """Google 응답 전체/토큰/URL은 표시하지 않고 허용된 오류 분류만 안내합니다."""
+    if isinstance(error,CalendarConfigError):return str(error)
+    if type(error).__name__=='RefreshError':
+        return 'Google 토큰 갱신 실패: 권한 만료/취소 또는 OAuth 설정 문제일 수 있습니다. 03에서 재인증 후 Secrets의 GOOGLE_TOKEN을 교체하세요.'
+    if isinstance(error,(ValueError,TypeError)):
+        return '일정 날짜/시각 형식 오류: 시작·종료 날짜와 HH:MM 시각을 확인하세요.'
+    code=getattr(getattr(error,'resp',None),'status',None)
+    reason=''
+    try:
+        data=json.loads(getattr(error,'content',b'{}'))
+        reason=data.get('error',{}).get('errors',[{}])[0].get('reason','')
+    except Exception:pass
+    if code==401:return 'Google 인증 실패 (401): 토큰을 다시 발급해 Streamlit Secrets에 반영하세요.'
+    if code in (403,429):
+        if reason in ('rateLimitExceeded','userRateLimitExceeded','quotaExceeded'):
+            return f'Google 호출 한도 초과 ({code}): 잠시 뒤 다시 시도하세요.'
+        return f'Google 접근 거부 ({code}): Calendar API 활성화·인증 계정·캘린더 쓰기 권한을 확인하세요.'
+    if code==400:return 'Google 일정 형식 오류 (400): 종일/시간 일정의 시작·종료 값을 확인하세요.'
+    if code in (404,410):return f'Google 일정 또는 캘린더를 찾을 수 없습니다 ({code}). 연결 계정과 삭제 여부를 확인하세요.'
+    if code==409:return 'Google 일정 ID 충돌 (409): Google 다시 확인·반영을 실행하세요.'
+    if isinstance(error,(OSError,TimeoutError)) or code in (500,502,503,504):
+        return 'Google 연결 지연/서버 오류: 잠시 뒤 재시도하세요.'
+    return 'Google 연동에 실패했습니다. Google 연결 진단에서 인증과 API 연결을 확인하세요.'
+
+
 # ========================================================================
 # 블록 08 | 음성 생성·재생
 # 완성된 텍스트를 Gemini로 낭독하고 브라우저에서 재생합니다. 즉시 음성 재생 기능을 유지합니다.
@@ -1065,7 +1131,7 @@ def pcm_to_wav(pcm, rate=24000):
 
 
 # 완성된 답변을 Gemini Live로 읽어 WAV 바이트를 반환합니다. 도구 선택은 하지 않습니다.
-async def live_speak(text):
+async def _live_speak_impl(text):
     if not os.getenv("GEMINI_API_KEY"):
         raise RuntimeError("GEMINI_API_KEY가 없습니다.")
     gemini = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
@@ -1097,6 +1163,12 @@ async def live_speak(text):
     return pcm_to_wav(bytes(spoken))
 
 
+async def live_speak(text):
+    """연결 시작부터 음성 수신 완료까지 전체에 제한 시간을 적용합니다."""
+    return await asyncio.wait_for(_live_speak_impl(text), timeout=VOICE_TIMEOUT_SECONDS)
+
+
+
 # 저장된 음성을 브라우저에서 재생합니다. 중복 재생 방지용 상태를 사용합니다.
 def render_voice():
     """기본 플레이어 하나로 자동 재생·일시정지·재개·탐색을 제공합니다."""
@@ -1121,12 +1193,17 @@ def render_voice():
 
 
 def speak_message(message):
-    """새 음성 생성만 Gemini를 호출합니다. 다시 듣기는 보관된 음성을 사용합니다."""
+    """음성 생성 전체에 제한 시간을 적용합니다. 실패해도 텍스트는 유지합니다."""
     try:
         wav=asyncio.run(live_speak(message['content']))
         cache_answer_audio(message,wav)
+        return True
+    except (TimeoutError, asyncio.TimeoutError):
+        st.session_state.voice_error=f'음성 응답이 {VOICE_TIMEOUT_SECONDS}초 내에 완료되지 않아 중단했습니다. 텍스트 답변은 유지됩니다.'
     except Exception:
         st.session_state.voice_error='음성 생성에 실패했습니다. 텍스트 답변은 유지됩니다.'
+    return False
+
 
 
 # ========================================================================
@@ -1230,12 +1307,28 @@ def briefing_text():
 
 
 def run_briefing():
-    message={'role':'assistant','content':briefing_text(),'message_id':uuid.uuid4().hex}
-    st.session_state.messages.append(message)
-    st.session_state.messages=st.session_state.messages[-MAX_TURNS*2:]
-    speak_message(message)
-    checkpoint_current_meeting()
+    """빈 업무 목록은 외부 호출 없이 즉시 종료합니다. 음성 실패와 중복 실행도 처리합니다."""
+    pending=[t for t in st.session_state.tasks if not t.get('done') and not t.get('trashed')]
+    if not pending:
+        st.info('브리핑할 미완료 업무가 없습니다. 회의록을 분석하거나 업무를 추가하세요.')
+        return
+    if st.session_state.get('briefing_busy'):
+        st.info('브리핑을 준비하고 있습니다. 잠시 기다려 주세요.')
+        return
+    st.session_state.briefing_busy=True
+    try:
+        message={'role':'assistant','content':briefing_text(),'message_id':uuid.uuid4().hex}
+        st.session_state.messages.append(message)
+        st.session_state.messages=st.session_state.messages[-MAX_TURNS*2:]
+        # 텍스트를 먼저 표시하고, 스피너와 함께 제한 시간 안에서만 음성을 생성합니다.
+        st.info(message['content'])
+        with st.spinner(f'업무 브리핑 음성을 준비합니다. 최대 {VOICE_TIMEOUT_SECONDS}초...'):
+            speak_message(message)
+        checkpoint_current_meeting()
+    finally:
+        st.session_state.briefing_busy=False
     st.rerun()
+
 
 
 # ========================================================================
@@ -1388,8 +1481,10 @@ def page_heading(icon, title, description):
 
 
 def render_home():
-    if st.button('오늘의 업무 음성 브리핑',key='today_briefing'):
-        run_briefing()
+    has_pending=any(not t.get('done') and not t.get('trashed') for t in st.session_state.tasks)
+    briefing_requested=st.button('오늘의 업무 음성 브리핑',key='today_briefing',disabled=not has_pending)
+    if not has_pending:
+        st.caption('미완료 업무가 없어 브리핑이 비활성화되어 있습니다. 업무를 먼저 추가하세요.')
     # 홈에서도 회의 요약 화면과 같은 업로드·기록 선택 기능을 제공합니다.
     with st.container(border=True):
         render_meeting_picker('home')
@@ -1401,7 +1496,7 @@ def render_home():
             with st.container(border=True):
                 calendar(
                     events=st.session_state.calendar_tasks,
-                    options={"initialView": "dayGridMonth", "locale": "ko", "height": 485, "headerToolbar": {"left": "prev,next", "center": "title", "right": "today"}},
+                    options={"initialView": "dayGridMonth", "locale": "ko", "timeZone": "local", "displayEventTime": True, "eventTimeFormat": {"hour": "2-digit", "minute": "2-digit", "hour12": False}, "height": 485, "headerToolbar": {"left": "prev,next", "center": "title", "right": "today"}},
                     key="work_calendar",
                 )
         with week:
@@ -1467,6 +1562,11 @@ def render_home():
     with chat:
         with st.container(border=True):
             render_chat("궁금한 내용을 입력하세요...")
+
+    # 먼저 홈 화면 전체를 표시한 뒤 음성을 기다려 빈 화면처럼 보이지 않게 합니다.
+    if briefing_requested:
+        run_briefing()
+
 
 
 # 업무·진행률·완료 체크·수동 추가 UI입니다. tasks와 앱 일정이 변경될 수 있습니다.
@@ -1699,6 +1799,39 @@ def render_backup_panel():
                 sync_calendar_tasks(force=True);st.rerun()
 
 
+def render_calendar_diagnostics():
+    with st.expander('Google Calendar 연결 진단 · 다시 확인'):
+        st.caption('앱 캘린더 표시는 Google 등록 성공과 별개입니다. 아래에서 실제 API 연결과 업무 상태를 확인하세요.')
+        if st.button('Google 연결 진단 (읽기만 수행)'):
+            try:
+                result=get_calendar_service().events().list(calendarId='primary',maxResults=1).execute()
+            except Exception as error:
+                st.session_state.calendar_connection_report={'ok':False,'message':calendar_error_message(error)}
+            else:
+                st.session_state.calendar_connection_report={'ok':True,'message':'기본 캘린더 API 읽기 성공','calendar':result.get('summary','이름 미제공')}
+        report=st.session_state.get('calendar_connection_report')
+        if report:
+            if report['ok']:
+                st.success(report['message']);st.write('토큰이 연결한 캘린더: '+report['calendar'])
+                st.caption('현재 브라우저에서 보고 있는 Google 계정과 같은 캘린더인지 확인하세요. 읽기 성공만으로 쓰기 권한까지 보장되지는 않습니다.')
+            else:st.error(report['message'])
+        for task in st.session_state.tasks:
+            reason='복원 후 연동 보류' if task.get('sync_paused') else '휴지통' if task.get('trashed') else '완료 업무' if task.get('done') else '날짜 미정' if not task.get('deadline') else task.get('sync_status','local')
+            st.write(task['title']+' · '+(task.get('deadline') or '날짜 미정')+' '+task.get('start_time','')+' · '+reason)
+            if task.get('date_error'):st.warning(task['date_error'])
+            if task.get('sync_error'):st.error(task['sync_error'])
+            if task.get('google_event_url'):st.link_button('Google에 등록된 일정 직접 열기',task['google_event_url'])
+        if st.button('Google 실제 일정 다시 확인·반영'):
+            result=sync_calendar_tasks(force=True)
+            st.session_state.calendar_manual_report=result
+            st.rerun()
+        result=st.session_state.get('calendar_manual_report')
+        if result:
+            st.write(f"반영 {len(result['registered'])}건 · 미변경 {len(result['unchanged'])}건 · 제외 {len(result['skipped'])}건 · 실패 {len(result['failed'])}건")
+            for failed in result['failed']:st.error(failed['summary']+': '+failed['reason'])
+        st.caption('백업 복원으로 보류된 업무는 기록 백업 영역에서 Google 연동 허용을 먼저 눌러야 합니다.')
+
+
 def main():
     """Streamlit이 실행할 시작점입니다. 함수 정의가 모두 끝난 뒤 호출합니다."""
     global client
@@ -1716,6 +1849,7 @@ def main():
     if sync_failures:
         st.warning(f"Google Calendar 연동 실패 {len(sync_failures)}건 · 내 업무에서 재시도할 수 있습니다.")
     render_voice()
+    render_calendar_diagnostics()
     render_mail_panel()
     render_backup_panel()
     with st.sidebar:
