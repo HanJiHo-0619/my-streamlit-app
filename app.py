@@ -6,6 +6,7 @@
 # ========================================================================
 
 import asyncio
+import time
 import re
 import copy
 import hashlib
@@ -31,9 +32,15 @@ from streamlit_calendar import calendar
 MODEL = "gpt-6-luna"
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 KST = timezone(timedelta(hours=9))
-# 실측: Gemini Live는 말하는 속도(한국어 약 7자/초)로 음성을 보내므로 389자 답변은 약 55초 걸립니다.
-# 그래서 답변을 문장 단위 조각으로 나눠 동시에 생성한 뒤 이어 붙입니다. (389자 → 약 20초)
-VOICE_TIMEOUT_SECONDS = 40  # 음성 생성 전체 대기 제한
+# 음성은 1순위로 Gemini 전용 TTS 모델이 답변 전체를 한 번에 만듭니다. 한 번의 요청이라 목소리가 처음부터 끝까지 같습니다.
+# TTS가 실패(503 요청 몰림 등)하면 2순위로 Gemini Live를 조각별로 동시에 사용합니다.
+# 실측: Live는 말하는 속도(한국어 약 7자/초)로만 음성을 보내 389자 답변이 약 55초 걸리고,
+#       조각을 나눠 동시에 만들면 약 20초로 줄지만 조각마다 음색이 달라질 수 있습니다.
+VOICE_MODEL = "gemini-3.8-flash-tts"  # 더 빠르게: "gemini-3.8-flash-lite-tts" (실측 약 2배 빠름)
+VOICE_NAME = "Leda"
+VOICE_TTS_TIMEOUT_SECONDS = 25  # 전용 TTS 대기 제한 (재시도 포함)
+VOICE_TTS_ATTEMPTS = 2  # 전용 TTS 시도 횟수
+VOICE_TIMEOUT_SECONDS = 40  # 예비 Live 조각 생성 전체 대기 제한
 VOICE_CHUNK_CHARS = 120  # 조각 하나의 최대 글자 수 (약 18초 분량)
 VOICE_PARALLEL = 4  # 동시에 만드는 조각 수
 VOICE_SCRIPT_THRESHOLD = 480  # 이보다 긴 답변은 업무를 모두 담은 낭독 대본으로 줄여서 읽음
@@ -250,6 +257,7 @@ events에는 김 대리에게 최종 배정된 업무만 넣습니다.
 {meeting_text}
 """
 
+# 예비 Live 낭독에만 사용합니다. 전용 TTS에는 지시문을 보내지 않습니다(실측: 지시 문장까지 소리 내어 읽음).
 VOICE_INSTRUCTIONS = """사용자가 준 문장을 바꾸거나 덧붙이지 말고 그대로 읽습니다."""
 
 # 빈/잘린 응답을 다시 생성할 때 사용합니다. 대본 속 요청 문장에 반응하지 않고 읽기만 하게 합니다.
@@ -623,7 +631,7 @@ def checkpoint_current_meeting():
         'summary':st.session_state.summary,
         'events':copy.deepcopy(st.session_state.events),
         'tasks':copy.deepcopy([t for t in st.session_state.tasks if t.get('source')=='meeting' and t.get('meeting_id')==identity]),
-        'messages':[{key:m[key] for key in ('role','content','message_id','audio_id','voice_mode','voice_text') if key in m} for m in st.session_state.messages[-MAX_TURNS*2:]],
+        'messages':[{key:m[key] for key in ('role','content','message_id','audio_id','voice_mode','voice_text','voice_engine') if key in m} for m in st.session_state.messages[-MAX_TURNS*2:]],
         'analyzed_meeting_id':st.session_state.get('analyzed_meeting_id',''),
     }
 
@@ -1256,6 +1264,42 @@ def speech_text(text):
     return re.sub(r'\n{2,}','\n',text).strip()
 
 
+def _tts_pcm(text):
+    """Gemini 전용 TTS로 답변 전체를 한 번에 낭독해 PCM(24kHz·16bit·mono)을 받습니다.
+    낭독할 문장만 보냅니다. 지시문을 붙이면 그 문장까지 읽기 때문입니다."""
+    if not os.getenv("GEMINI_API_KEY"):
+        raise RuntimeError("GEMINI_API_KEY가 없습니다.")
+    gemini = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
+                          http_options=types.HttpOptions(timeout=VOICE_TTS_TIMEOUT_SECONDS*1000))
+    response = gemini.models.generate_content(
+        model=VOICE_MODEL,
+        contents=text,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=VOICE_NAME))),
+        ),
+    )
+    content = response.candidates[0].content if response.candidates else None
+    parts = content.parts if content and content.parts else []
+    return b"".join(p.inline_data.data for p in parts if p.inline_data and p.inline_data.data)
+
+
+def synthesize_speech(text):
+    """1순위 전용 TTS(같은 목소리), 실패하면 2순위 Live 조각 동시 생성. 반환: (WAV 바이트, 'tts' 또는 'live')"""
+    started = time.time()
+    for _ in range(VOICE_TTS_ATTEMPTS):
+        if time.time()-started > VOICE_TTS_TIMEOUT_SECONDS:
+            break
+        try:
+            pcm = _tts_pcm(text)
+            if not audio_too_short(pcm, text):
+                return pcm_to_wav(pcm), "tts"
+        except Exception:
+            pass  # 503(요청 몰림)·시간 초과·빈 응답이면 한 번 더 시도한 뒤 예비 경로로 넘어갑니다.
+    return asyncio.run(live_speak(text, VOICE_TIMEOUT_SECONDS)), "live"
+
+
 def voice_script(text):
     """아주 긴 답변을 낭독 대본으로 줄입니다. 김 대리 업무명·마감은 모두 남기고 새 사실은 추가하지 않습니다."""
     response=client.with_options(timeout=VOICE_SCRIPT_TEXT_TIMEOUT_SECONDS).responses.create(
@@ -1282,7 +1326,9 @@ def render_voice():
             st.session_state.active_audio_id=chosen
             st.session_state.autoplay_audio_id=chosen
             st.rerun()
-        autoplay=st.session_state.pop('autoplay_audio_id','')==active
+        # 자동 재생 표시를 지우지 않고 유지합니다. 화면이 다시 그려져도 플레이어 설정이 그대로라 멈추지 않고,
+        # Streamlit은 같은 플레이어를 한 번만 자동 재생하므로 다시 처음부터 재생되지도 않습니다.
+        autoplay=st.session_state.get('autoplay_audio_id','')==active
         st.audio(vault[active]['data'],format='audio/wav',autoplay=autoplay)
         st.caption('플레이어에서 일시정지/계속 재생이 가능합니다. 재생 막대를 맨 앞으로 옮기면 처음부터 들을 수 있습니다.')
         st.download_button('이 음성 다운로드',vault[active]['data'],file_name='answer.wav',mime='audio/wav',key='audio_download_'+active)
@@ -1290,17 +1336,19 @@ def render_voice():
 
 
 def speak_message(message):
-    """답변을 조각으로 나눠 동시에 낭독합니다. 아주 긴 답변은 업무를 모두 담은 낭독 대본으로 줄여 읽습니다.
-    텍스트 답변은 항상 그대로 유지합니다. voice_mode: full(전체) / script(낭독 대본) / failed."""
+    """답변을 음성으로 만듭니다. 아주 긴 답변은 업무를 모두 담은 낭독 대본으로 줄여 읽습니다.
+    텍스트 답변은 항상 그대로 유지합니다. voice_mode: full(전체) / script(낭독 대본) / failed,
+    voice_engine: tts(전용 TTS) / live(예비 방식)."""
     full=speech_text(message['content'])
     script,mode=full,'full'
     if len(full)>VOICE_SCRIPT_THRESHOLD:
         try:script,mode=voice_script(full),'script'
         except Exception:pass  # 대본 생성이 실패하면 전체 답변을 그대로 읽습니다.
     try:
-        wav=asyncio.run(live_speak(script,VOICE_TIMEOUT_SECONDS))
+        wav,engine=synthesize_speech(script)
         cache_answer_audio(message,wav)
         message['voice_mode']=mode
+        message['voice_engine']=engine
         if mode=='script':message['voice_text']=script
         else:message.pop('voice_text',None)
         return True
@@ -1535,6 +1583,8 @@ def render_chat(placeholder):
             if audio_id and audio_id in st.session_state.audio_vault:
                 if message.get('voice_mode')=='script':
                     st.caption('🔊 답변이 길어 업무 중심 낭독 대본으로 읽었습니다: '+message.get('voice_text',''))
+                if message.get('voice_engine')=='live':
+                    st.caption('🔊 음성 서버가 혼잡해 예비 방식으로 생성했습니다. 구간마다 목소리가 조금 다를 수 있습니다.')
                 if st.button('이 답변 다시 듣기',key='relisten_'+message['message_id']):
                     st.session_state.active_audio_id=audio_id
                     st.session_state.autoplay_audio_id=audio_id
@@ -1936,15 +1986,17 @@ def main():
     client = OpenAI()
     initialize_state()
     initialize_feature_state()
+    st.markdown(APP_STYLE, unsafe_allow_html=True)
+    # 음성 플레이어를 가장 먼저 그립니다. 아래 Google 일정 동기화가 오래 걸려도 답변 음성이 바로 재생되고,
+    # 화면 맨 위 고정 위치라 다른 경고가 생겨도 플레이어가 다시 만들어지지 않습니다.
+    render_voice()
     checkpoint_current_meeting()
     sync_calendar_tasks()
     checkpoint_current_meeting()
-    st.markdown(APP_STYLE, unsafe_allow_html=True)
     load_saved_uploads()
     sync_failures = [t for t in st.session_state.tasks if t.get('sync_status')=='failed' and not t.get('trashed') and not t.get('done')]
     if sync_failures:
         st.warning(f"Google Calendar 연동 실패 {len(sync_failures)}건 · 내 업무에서 재시도할 수 있습니다.")
-    render_voice()
     render_calendar_diagnostics()
     render_mail_panel()
     render_backup_panel()
