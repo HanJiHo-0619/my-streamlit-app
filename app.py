@@ -224,6 +224,8 @@ events에는 김 대리에게 최종 배정된 업무만 넣습니다.
 3. YYYY-MM-DD 날짜가 명시되지 않았다면 start_date와 end_date는 빈 문자열입니다.
 4. "다음 주", "금요일", "빨리" 등의 표현을 임의로 특정 날짜로 변환하지 않습니다.
 5. 시각이 명시되지 않았다면 has_clock_time은 false이고 start_time, end_time은 빈 문자열입니다.
+   - "15:00까지"처럼 마감 시각 하나만 있으면 start_time에 24시간제 HH:MM(예: 15:00)을 넣고 end_time은 빈 문자열입니다.
+   - end_time은 "14:00~16:00"처럼 종료 시각이 별도로 명시된 경우에만 입력하며 start_time과 같은 값을 넣지 않습니다.
 6. 동일 업무는 events에 중복 추가하지 않습니다.
 7. 김 대리에게 확정된 업무가 없다면 events는 빈 배열입니다.
 
@@ -417,7 +419,18 @@ def sync_checklist(events):
                             end_date=(event.get('end_date','') if start_time else dates[1]) if dates else '',
                             start_time=start_time, end_time=end_time, date_error='', date_resolution=resolution, deadline_base=st.session_state.meeting_date)
             except ValueError as error:
-                task.update(deadline='', end_date='', start_time='', end_time='', date_error=str(error))
+                # 시각만 잘못된 경우 확정 날짜까지 지우지 않고 종일 일정으로 유지합니다.
+                try:
+                    resolved_event, resolution = resolve_event_deadline(event, st.session_state.meeting_date)
+                    dates = event_dates(resolved_event, '')
+                except ValueError:
+                    dates = None
+                if dates:
+                    task.update(deadline=dates[0], end_date=dates[1], start_time='', end_time='',
+                                date_error='시각을 해석하지 못해 종일 일정으로 표시합니다. 일정 수정에서 시각을 지정하세요. ('+str(error)+')',
+                                date_resolution=resolution, deadline_base=st.session_state.meeting_date)
+                else:
+                    task.update(deadline='', end_date='', start_time='', end_time='', date_error=str(error))
         task['meeting_name'] = st.session_state.get('current_meeting_name','회의록')
         task.setdefault('trashed',False)
         result[task_id] = task
@@ -864,14 +877,18 @@ def clock_text(event):
     start=(event.get('start_time') or '').strip()
     end=(event.get('end_time') or '').strip()
     if not start:
-        match=re.search(r'(?:오전|오후)\s*\d{1,2}(?:시|:\d{2})(?:\s*\d{1,2}분)?|(?<!\d)\d{1,2}:\d{2}(?::\d{2})?',event.get('due_text') or '')
+        # 기한 원문의 시각도 찾습니다. '15시'처럼 오전/오후가 없는 표현도 인식하고 '3시간'은 제외합니다.
+        match=re.search(r'(?:오전|오후)\s*\d{1,2}\s*(?:시(?!간)(?:\s*\d{1,2}\s*분|\s*반)?|:\d{2})|(?<!\d)\d{1,2}\s*시(?!간)(?:\s*\d{1,2}\s*분|\s*반)?|(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?:\s*[AaPp][Mm])?',event.get('due_text') or '')
         if match:start=match.group(0)
-    if not start and not event.get('has_clock_time'):return '', ''
-    if not start:raise ValueError('시각이 있는 일정에는 시작 시각이 필요합니다.')
+    # has_clock_time만 true이고 실제 시각을 찾지 못하면 날짜를 버리지 않고 종일 일정으로 둡니다.
+    if not start:return '', ''
     def normalize(value):
         if not value:return ''
-        value=re.sub(r'\s+','',value)
-        match=re.fullmatch(r'(오전|오후)?(\d{1,2})(?::(\d{2})(?::00)?|시(?:(\d{1,2})분)?)',value)
+        value=re.sub(r'\s+','',value).replace('：',':')
+        value=re.sub(r'^(\d{1,2}:\d{2})(?::\d{2})?([AaPp][Mm])$',lambda m:{'a':'오전','p':'오후'}[m.group(2)[0].lower()]+m.group(1),value)
+        value=re.sub(r'^([AaPp][Mm])',lambda m:{'a':'오전','p':'오후'}[m.group(1)[0].lower()],value)
+        value=re.sub(r'시반$','시30분',value)
+        match=re.fullmatch(r'(오전|오후)?(\d{1,2})(?::(\d{2})(?::\d{2})?|시(?:(\d{1,2})분)?)',value)
         if not match:raise ValueError('시각은 HH:MM 또는 오전/오후 N시 형식으로 입력하세요.')
         ampm,hour,minute,korean_minute=match.groups();hour=int(hour);minute=int(minute or korean_minute or 0)
         if ampm:
@@ -879,7 +896,8 @@ def clock_text(event):
             hour=hour%12+(12 if ampm=='오후' else 0)
         if not 0<=hour<24 or not 0<=minute<60:raise ValueError('시각은 00:00~23:59 범위여야 합니다.')
         return f'{hour:02d}:{minute:02d}'
-    return normalize(start), normalize(end)
+    start, end = normalize(start), normalize(end)
+    return start, ('' if end == start else end)  # 시작=종료는 마감 시각 하나로 봅니다.
 
 
 
@@ -898,13 +916,18 @@ def google_time_body(start_date, start_time, end_time, end_date=''):
     if start_time:
         start_time,end_time=clock_text({'has_clock_time':True,'start_time':start_time,'end_time':end_time})
         start = datetime.fromisoformat(f'{start_date}T{start_time}').replace(tzinfo=KST)
-        if end_time:
+        explicit_end_day = bool(end_date) and date.fromisoformat(end_date) != start_day
+        if end_time and end_time != start_time:
             end_day = date.fromisoformat(end_date) if end_date else start_day
             end = datetime.fromisoformat(f'{end_day.isoformat()}T{end_time}').replace(tzinfo=KST)
+            if end <= start and not explicit_end_day:
+                # 종료 날짜 없이 종료 시각이 더 이르면 자정을 넘긴 일정으로 봅니다. (예: 23:30~00:30)
+                end += timedelta(days=1)
         else:
+            # '15:00 마감'처럼 시작=종료로 온 마감 시각은 기본 1시간 일정으로 표시합니다.
             end = start + timedelta(hours=1)
         if end <= start:
-            raise ValueError('종료 시각은 시작 시각보다 뒤여야 합니다. 자정을 넘으면 종료 날짜도 지정하세요.')
+            raise ValueError('종료 시각은 시작 시각보다 뒤여야 합니다. 종료 날짜를 확인하세요.')
         return {'start':{'dateTime':start.isoformat(),'timeZone':'Asia/Seoul'},
                 'end':{'dateTime':end.isoformat(),'timeZone':'Asia/Seoul'}}
     if end_time:
