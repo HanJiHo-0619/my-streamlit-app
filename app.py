@@ -6,6 +6,7 @@
 # ========================================================================
 
 import asyncio
+import re
 import copy
 import hashlib
 import uuid
@@ -31,6 +32,7 @@ MODEL = "gpt-6-luna"
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 KST = timezone(timedelta(hours=9))
 MAX_TURNS = 10  # 회의별 최근 대화 10회 왕복
+WEEK_DEADLINE_WEEKDAY = 4  # 요일 없는 주 단위 기한: 월=0~일=6, None이면 자동 계산 안 함
 MAX_MEETING_HISTORY = 10  # 최근 회의 기록 수 (원문·분석·업무·대화)
 GOOGLE_CALENDAR_URL = "https://calendar.google.com/calendar/"
 
@@ -130,7 +132,7 @@ ASSISTANT_INSTRUCTIONS = """
 1. 사용자가 일정 등록을 명시적으로 요청한 경우에만 register_calendar_events 도구를 호출합니다.
 2. 사용자가 회의 기준일을 명시한 경우 meeting_date에 YYYY-MM-DD 형식으로 전달합니다.
 3. 사용자가 회의 기준일을 말하지 않았다면 meeting_date에는 빈 문자열을 전달합니다.
-4. 상대 날짜는 임의로 확정하지 않습니다. 날짜가 미정이면 앱의 일정 수정에서 명시 날짜를 지정하도록 안내합니다.
+4. 상대 기한은 원문 그대로 추출합니다. 앱이 회의 기준일과 표시된 날짜 규칙으로 계산하며, 실제 업무 deadline과 연동 결과를 확인해 안내합니다.
 5. 회의록에 명확한 날짜가 없는 업무에 대해 임의로 마감일을 확정했다고 말하지 않습니다.
 6. 도구가 반환한 등록 결과를 확인하고 등록된 업무와 등록되지 않은 업무를 구분합니다.
 7. 등록에 실패하거나 제외된 업무를 등록 완료했다고 말하지 않습니다.
@@ -348,6 +350,8 @@ def initialize_state():
         st.session_state.meeting_text = ""
     if "page" not in st.session_state:
         st.session_state.page = "홈"
+    if "meeting_date" not in st.session_state:
+        st.session_state.meeting_date = datetime.now(KST).date().isoformat()
     if "meeting_id" not in st.session_state:
         st.session_state.meeting_id = ""
     if "analyzed_meeting_id" not in st.session_state:
@@ -398,13 +402,14 @@ def sync_checklist(events):
                     event_id=old.get('event_id',''), sync_status=old.get('sync_status','local'))
         if not old.get('edited'):
             try:
-                dates = event_dates(event, '')
+                resolved_event, resolution = resolve_event_deadline(event, st.session_state.meeting_date)
+                dates = event_dates(resolved_event, '')
                 start_time, end_time = clock_text(event)
                 if dates:
                     google_time_body(dates[0], start_time, end_time, dates[1] if not start_time else event.get('end_date',''))
                 task.update(deadline=dates[0] if dates else '',
                             end_date=(event.get('end_date','') if start_time else dates[1]) if dates else '',
-                            start_time=start_time, end_time=end_time, date_error='')
+                            start_time=start_time, end_time=end_time, date_error='', date_resolution=resolution, deadline_base=st.session_state.meeting_date)
             except ValueError as error:
                 task.update(deadline='', end_date='', start_time='', end_time='', date_error=str(error))
         task['meeting_name'] = st.session_state.get('current_meeting_name','회의록')
@@ -512,6 +517,7 @@ def select_meeting(text):
         by_id.setdefault(task['task_id'],copy.deepcopy(task))
     st.session_state.meeting_id = identity
     st.session_state.meeting_text = text
+    st.session_state.meeting_date = snapshot.get('meeting_date') or datetime.now(KST).date().isoformat()
     st.session_state.current_meeting_name = item['name'] if item else '선택한 회의록'
     st.session_state.summary = snapshot.get('summary','')
     st.session_state.events = copy.deepcopy(snapshot.get('events',[]))
@@ -572,6 +578,7 @@ def checkpoint_current_meeting():
     if item is None:
         return
     item['snapshot'] = {
+        'meeting_date':st.session_state.get('meeting_date',''),
         'summary':st.session_state.summary,
         'events':copy.deepcopy(st.session_state.events),
         'tasks':copy.deepcopy([t for t in st.session_state.tasks if t.get('source')=='meeting' and t.get('meeting_id')==identity]),
@@ -849,6 +856,55 @@ def sync_calendar_tasks(force=False):
     return result
 
 
+def resolve_event_deadline(event, meeting_date):
+    """기한 원문은 유지하고, 화면의 회의 기준일과 명시 규칙으로 날짜를 계산합니다."""
+    result = dict(event)
+    due = (event.get('due_text') or '').strip()
+    base = date.fromisoformat(meeting_date)
+    resolved, rule = None, ''
+    # 구체적인 원문 날짜가 상대 표현보다 우선합니다.
+    iso = re.search(r'(\d{4})[-./](\d{1,2})[-./](\d{1,2})', due)
+    month_day = re.search(r'(?:(\d{4})\s*년\s*)?(\d{1,2})\s*월\s*(\d{1,2})\s*일', due)
+    if iso:
+        resolved = date(*map(int,iso.groups()));rule='원문 명시 날짜'
+    elif month_day:
+        year, month, day = month_day.groups()
+        resolved = date(int(year) if year else base.year,int(month),int(day))
+        rule='원문 날짜 · 연도는 회의 기준일 사용' if not year else '원문 명시 날짜'
+    elif (event.get('start_date') or '').strip() and not re.search(r'다음|이번|모레|내일|오늘|당일|요일|\d+\s*일\s*(?:뒤|후)', due):
+        # 모델의 구조화된 명시 날짜가 이미 있으면 먼저 유지합니다.
+        date.fromisoformat(event['start_date'])
+        return result, '분석에서 추출한 명시 날짜'
+    else:
+        normalized = re.sub(r'\s+','',due)
+        weekdays={'월':0,'화':1,'수':2,'목':3,'금':4,'토':5,'일':6}
+        week = re.search(r'(다음|이번|다다음)주([월화수목금토일])요일',normalized)
+        offset = re.search(r'(\d+)일(?:뒤|후)',normalized)
+        bare_day = re.search(r'([월화수목금토일])요일',normalized)
+        if week:
+            kind, weekday=week.groups();weeks={'이번':0,'다음':1,'다다음':2}[kind]
+            resolved=base-timedelta(days=base.weekday())+timedelta(weeks=weeks,days=weekdays[weekday])
+            rule='회의 기준일의 '+kind+' 주 '+weekday+'요일'
+        elif '다음주' in normalized or '이번주' in normalized or '다다음주' in normalized:
+            # 요일 없는 주 단위 표현의 정책은 설정값/화면에 명시합니다.
+            kind='다다음' if '다다음주' in normalized else '다음' if '다음주' in normalized else '이번'
+            if WEEK_DEADLINE_WEEKDAY is not None:
+                resolved=base-timedelta(days=base.weekday())+timedelta(weeks={'이번':0,'다음':1,'다다음':2}[kind],days=WEEK_DEADLINE_WEEKDAY)
+                rule='앱 규칙: 요일 없는 '+kind+' 주 기한 → '+list(weekdays)[WEEK_DEADLINE_WEEKDAY]+'요일'
+        elif '모레' in normalized:resolved=base+timedelta(days=2);rule='회의 기준일 + 2일'
+        elif '내일' in normalized:resolved=base+timedelta(days=1);rule='회의 기준일 + 1일'
+        elif '오늘' in normalized or '당일' in normalized:resolved=base;rule='회의 기준일'
+        elif offset:resolved=base+timedelta(days=int(offset.group(1)));rule='회의 기준일 + '+offset.group(1)+'일'
+        elif bare_day:
+            delta=(weekdays[bare_day.group(1)]-base.weekday())%7
+            resolved=base+timedelta(days=delta);rule='회의 기준일 이후 가장 가까운 '+bare_day.group(1)+'요일'
+    if resolved:
+        result['start_date']=resolved.isoformat()
+        # 종료일이 별도로 명시되지 않은 경우 공통 날짜 검증기가 계산합니다.
+        result['end_date']=event.get('end_date') or ''
+    return result, rule or '날짜 미정 · 직접 지정 필요'
+
+
 # ========================================================================
 # 블록 08 | 음성 생성·재생
 # 완성된 텍스트를 Gemini로 낭독하고 브라우저에서 재생합니다. 즉시 음성 재생 기능을 유지합니다.
@@ -1046,7 +1102,10 @@ APP_STYLE = """
     :root { --mint: #10a985; --mint-dark: #078768; --mint-pale: #e6f8f2; --ink: #10172c; --muted: #687287; --line: #e7ebf0; }
     * { font-family: "Pretendard", "Noto Sans KR", "Malgun Gothic", sans-serif; }
     .stApp { background: linear-gradient(145deg, #fff 0%, #fff 70%, #f2fffa 100%); color: var(--ink); }
-    #MainMenu, footer, [data-testid="stHeader"] { visibility: hidden; }
+    #MainMenu, footer { visibility: hidden; }
+    /* 기본 헤더를 숨기면 사이드바 다시 열기 버튼까지 사라질 수 있으므로 유지합니다. */
+    [data-testid="stHeader"] { visibility: visible !important; background: rgba(255,255,255,.95); }
+    [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"], [data-testid="stSidebarCollapseButton"] { visibility: visible !important; }
     [data-testid="stAppViewContainer"] > .main { background: radial-gradient(ellipse 45% 12% at 88% 6%, #def8ef 0%, rgba(222,248,239,0) 80%); }
     .block-container { max-width: 1510px; padding: 2rem 3.2rem 2.5rem; }
     [data-testid="stSidebar"] { background: linear-gradient(180deg, #f7fffc, #effbf7); border-right: 1px solid #e5f2ed; }
@@ -1300,6 +1359,7 @@ def render_tasks():
                     set_task_trashed(task['task_id'],True);st.rerun()
             st.caption('출처: '+(task.get('meeting_name') or '직접 추가')+' · '+(dday_label(task.get('deadline','')) or '날짜 미정'))
             if task.get('due_text'):st.caption('기한 원문: '+task['due_text'])
+            if task.get('date_resolution'):st.caption('날짜 해석: '+task['date_resolution']+' · 기준일 '+task.get('deadline_base',''))
             st.caption('Google: '+{'synced':'연동 완료','failed':'연동 실패','local':'미등록'}.get(task.get('sync_status'),'미등록'))
             if task.get('sync_error'):st.warning(task['sync_error'])
     if any(t.get('sync_status')=='failed' and not t.get('trashed') and not t.get('done') for t in tasks):
@@ -1371,6 +1431,7 @@ def render_meeting_picker(location):
                         st.rerun()
     if st.session_state.get('meeting_id'):
         st.caption('현재 회의: '+st.session_state.get('current_meeting_name','선택한 회의록'))
+    render_meeting_date(location)
     with st.expander(f'최근 회의 ({len(st.session_state.uploads)}/{MAX_MEETING_HISTORY})',expanded=location=='meetings'):
         st.caption('현재 접속 세션에서 원문·분석·업무·최근 대화를 보관합니다. 새 접속/서버 재시작 후에는 초기화될 수 있습니다.')
         for item in st.session_state.uploads[:MAX_MEETING_HISTORY]:
@@ -1388,10 +1449,28 @@ def render_meeting_picker(location):
                 file_name='meeting_history.json',mime='application/json',key='history_export_'+location)
 
 
+def render_meeting_date(location):
+    """선택한 회의에 기준일을 저장합니다. 바뀌면 자동 계산 업무만 재계산·재연동합니다."""
+    if not st.session_state.get('meeting_id'):
+        return
+    current = st.session_state.get('meeting_date') or datetime.now(KST).date().isoformat()
+    picked = st.date_input('회의 기준일 · 상대 기한 계산에 사용',value=date.fromisoformat(current),
+        key='meeting_date_'+location+'_'+st.session_state.meeting_id+'_'+current)
+    st.caption('기준일 기본값은 한국시간 오늘입니다. 실제 회의일이 다르면 변경하세요.')
+    st.caption('날짜 규칙: 요일 없는 이번/다음 주 기한은 금요일로 계산합니다. 원문 기한과 적용 규칙을 업무에 표시합니다.' if WEEK_DEADLINE_WEEKDAY==4 else '주 단위 날짜 규칙은 블록 2의 WEEK_DEADLINE_WEEKDAY 설정을 사용합니다.')
+    if picked.isoformat()!=current:
+        st.session_state.meeting_date=picked.isoformat()
+        if st.session_state.events:
+            sync_checklist(st.session_state.events)
+            sync_calendar_tasks()
+        checkpoint_current_meeting()
+        st.rerun()
+
+
 def main():
     """Streamlit이 실행할 시작점입니다. 함수 정의가 모두 끝난 뒤 호출합니다."""
     global client
-    st.set_page_config(page_title="AIVLE", page_icon="🤖", layout="wide")
+    st.set_page_config(page_title="AIVLE", page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
     load_local_env()
     client = OpenAI()
     initialize_state()
