@@ -29,6 +29,16 @@ from googleapiclient.discovery import build
 from openai import OpenAI
 from streamlit_calendar import calendar
 
+
+# 자주 바꾸는 GitHub 배포 설정은 여기에서만 수정합니다.
+# GH_TOKEN은 Colab Secrets에 보관하며 코드에 직접 입력하지 않습니다.
+GH_USER = "HanJiHo-0619"
+REPO = "my-streamlit-app"
+
+# 메일 수신 주소: 여기서 변경합니다. 요청에서 지정한 주소가 있으면 그 주소가 우선입니다.
+DEFAULT_RECIPIENT = "giho9890@naver.com"
+
+
 MODEL = "gpt-6-luna"
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 KST = timezone(timedelta(hours=9))
@@ -58,13 +68,6 @@ MAX_MEETING_HISTORY = 10  # 최근 회의 기록 수 (원문·분석·업무·�
 GOOGLE_CALENDAR_URL = "https://calendar.google.com/calendar/"
 
 
-# 자주 바꾸는 GitHub 배포 설정은 여기에서만 수정합니다.
-# GH_TOKEN은 Colab Secrets에 보관하며 코드에 직접 입력하지 않습니다.
-GH_USER = "HanJiHo-0619"
-REPO = "my-streamlit-app"
-
-# 메일 수신 주소: 여기서 변경합니다. 요청에서 지정한 주소가 있으면 그 주소가 우선입니다.
-DEFAULT_RECIPIENT = "giho9890@naver.com"
 
 # 주소록: "팀장님께 보내줘"처럼 호칭으로 요청하면 여기서 주소를 찾습니다. '님·께·에게'는 자동으로 뗍니다.
 # 예) CONTACTS = {"팀장": "leader@example.com", "박과장": "park@example.com"}
