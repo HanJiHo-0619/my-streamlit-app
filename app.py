@@ -31,6 +31,10 @@ from streamlit_calendar import calendar
 MODEL = "gpt-6-luna"
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 KST = timezone(timedelta(hours=9))
+MAX_AUDIO_ITEMS = 10
+MAX_AUDIO_BYTES = 30 * 1024 * 1024  # 최근 음성 총 30MB, 오래된 음성부터 정리
+MAX_MAIL_HISTORY = 20
+MAX_BACKUP_BYTES = 20 * 1024 * 1024
 MAX_TURNS = 10  # 회의별 최근 대화 10회 왕복
 WEEK_DEADLINE_WEEKDAY = 4  # 요일 없는 주 단위 기한: 월=0~일=6, None이면 자동 계산 안 함
 MAX_MEETING_HISTORY = 10  # 최근 회의 기록 수 (원문·분석·업무·대화)
@@ -118,6 +122,7 @@ ASSISTANT_INSTRUCTIONS = """
 10. 마감일이 없거나 취소됐다면 마감일이 정해지지 않았다고 안내합니다.
 
 [이메일 기능]
+메일 도구의 awaiting_confirmation은 초안 준비 상태이며 실제 발송 완료가 아닙니다. 화면의 미리보기에서 확인 후 발송하도록 안내합니다.
 1. 사용자가 이메일 발송을 명시적으로 요청한 경우에만 send_email 도구를 호출합니다.
 2. 수신 주소를 지정하지 않은 발송 요청은 기본 수신자를 사용하도록 to에 빈 문자열을 전달합니다.
    구체적인 주소를 지정했다면 to에 그 주소를 전달하고, 주소 표현이나 발송 내용이 모호하면 확인합니다.
@@ -202,6 +207,7 @@ events에는 김 대리에게 최종 배정된 업무만 넣습니다.
 기존 JSON 필드명과 자료형을 변경하지 않습니다.
 
 - summary: 업무 제목
+- evidence: 업무 배정의 근거가 되는 실제 회의록의 연속 문장을 그대로 인용합니다. 없으면 빈 문자열입니다.
 - description: 해야 할 일과 구체적인 요청사항
 - owner: "김대리"
 - due_text: 회의록에 나온 최종 기한 표현
@@ -257,7 +263,7 @@ TOOLS = [
     {
         "type": "function",
         "name": "send_email",
-        "description": "저장된 회의 요약을 이메일로 보냅니다. 사용자가 이메일 발송을 명시적으로 요청할 때만 호출합니다.",
+        "description": "회의 요약의 메일 초안을 준비합니다. 실제 발송은 화면의 확인 후 발송 버튼에서만 실행됩니다. 발송 요청이 있을 때만 호출합니다.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -288,44 +294,36 @@ TOOLS = [
     },
 ]
 
-MEETING_RESPONSE_FORMAT = {
-            "format": {
-                "type": "json_schema",
-                "name": "meeting_pack",
-                "strict": True,
-                "schema": {
-                    "type": "object",
-                    "properties": {
-                        "summary": {"type": "string"},
-                        "events": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "summary": {"type": "string"},
-                                    "description": {"type": "string"},
-                                    "owner": {"type": "string"},
-                                    "due_text": {"type": "string"},
-                                    "has_clock_time": {"type": "boolean"},
-                                    "start_date": {"type": "string"},
-                                    "end_date": {"type": "string"},
-                                    "start_time": {"type": "string"},
-                                    "end_time": {"type": "string"},
-                                },
-                                "required": [
-                                    "summary", "description", "owner", "due_text",
-                                    "has_clock_time", "start_date", "end_date",
-                                    "start_time", "end_time",
-                                ],
-                                "additionalProperties": False,
-                            },
-                        },
-                    },
-                    "required": ["summary", "events"],
-                    "additionalProperties": False,
-                },
-            }
-        }
+MEETING_RESPONSE_FORMAT = {'format': {'type': 'json_schema',
+            'name': 'meeting_pack',
+            'strict': True,
+            'schema': {'type': 'object',
+                       'properties': {'summary': {'type': 'string'},
+                                      'events': {'type': 'array',
+                                                 'items': {'type': 'object',
+                                                           'properties': {'summary': {'type': 'string'},
+                                                                          'description': {'type': 'string'},
+                                                                          'owner': {'type': 'string'},
+                                                                          'due_text': {'type': 'string'},
+                                                                          'has_clock_time': {'type': 'boolean'},
+                                                                          'start_date': {'type': 'string'},
+                                                                          'end_date': {'type': 'string'},
+                                                                          'start_time': {'type': 'string'},
+                                                                          'end_time': {'type': 'string'},
+                                                                          'evidence': {'type': 'string'}},
+                                                           'required': ['summary',
+                                                                        'description',
+                                                                        'owner',
+                                                                        'due_text',
+                                                                        'has_clock_time',
+                                                                        'start_date',
+                                                                        'end_date',
+                                                                        'start_time',
+                                                                        'end_time',
+                                                                        'evidence'],
+                                                           'additionalProperties': False}}},
+                       'required': ['summary', 'events'],
+                       'additionalProperties': False}}}
 
 
 # ========================================================================
@@ -400,6 +398,13 @@ def sync_checklist(events):
                     meeting_id=st.session_state.meeting_id, description=event.get('description',''),
                     due_text=event.get('due_text',''), done=old.get('done',False),
                     event_id=old.get('event_id',''), sync_status=old.get('sync_status','local'))
+        task['extracted_title'] = title
+        if old.get('content_edited'):
+            task['title'] = old['title']
+            task['description'] = old.get('description','')
+        evidence = (event.get('evidence') or '').strip()
+        task['evidence_verified'] = bool(evidence and re.sub(r'\s+','',evidence) in re.sub(r'\s+','',st.session_state.meeting_text))
+        task['evidence'] = evidence if task['evidence_verified'] else ''
         if not old.get('edited'):
             try:
                 resolved_event, resolution = resolve_event_deadline(event, st.session_state.meeting_date)
@@ -524,7 +529,7 @@ def select_meeting(text):
     st.session_state.tasks = list(by_id.values())  # 다른 회의의 업무도 계속 보존합니다.
     st.session_state.messages = copy.deepcopy(snapshot.get('messages',[]))[-MAX_TURNS*2:]
     st.session_state.analyzed_meeting_id = snapshot.get('analyzed_meeting_id','')
-    for key in ['autoplay_voice','voice_error']:
+    for key in ['autoplay_voice','voice_error','autoplay_audio_id']:
         st.session_state.pop(key,None)
     # 같은 업무를 다른 회의에서 보던 위젯의 완료 상태가 복원 결과를 덮지 않게 합니다.
     for key in list(st.session_state):
@@ -582,7 +587,7 @@ def checkpoint_current_meeting():
         'summary':st.session_state.summary,
         'events':copy.deepcopy(st.session_state.events),
         'tasks':copy.deepcopy([t for t in st.session_state.tasks if t.get('source')=='meeting' and t.get('meeting_id')==identity]),
-        'messages':[{'role':m['role'],'content':m['content']} for m in st.session_state.messages[-MAX_TURNS*2:]],
+        'messages':[{key:m[key] for key in ('role','content','message_id','audio_id') if key in m} for m in st.session_state.messages[-MAX_TURNS*2:]],
         'analyzed_meeting_id':st.session_state.get('analyzed_meeting_id',''),
     }
 
@@ -592,6 +597,117 @@ def set_task_trashed(task_id, trashed):
     task = next(t for t in st.session_state.tasks if t['task_id']==task_id)
     task['trashed'] = bool(trashed)
     refresh_app_calendar()
+
+
+def initialize_feature_state():
+    """추가 기능 상태는 세션별로 보관합니다. 인증정보는 포함하지 않습니다."""
+    defaults={'audio_vault':{},'active_audio_id':'','pending_email':None,'mail_history':[]}
+    for key,value in defaults.items():
+        if key not in st.session_state:st.session_state[key]=value
+
+
+def cache_answer_audio(message, wav):
+    """음성은 한 번만 보관하고 대화에는 ID만 연결합니다. 오래된 음성부터 정리합니다."""
+    if len(wav)>MAX_AUDIO_BYTES:
+        raise ValueError('음성이 보관 용량을 초과했습니다. 텍스트 답변은 유지됩니다.')
+    audio_id=message.setdefault('message_id',uuid.uuid4().hex)
+    st.session_state.audio_vault.pop(audio_id,None)
+    st.session_state.audio_vault[audio_id]={'data':wav,'meeting_id':st.session_state.get('meeting_id',''),
+        'label':message['content'][:45],'created_at':datetime.now(KST).isoformat()}
+    while len(st.session_state.audio_vault)>MAX_AUDIO_ITEMS or sum(len(a['data']) for a in st.session_state.audio_vault.values())>MAX_AUDIO_BYTES:
+        oldest=next(iter(st.session_state.audio_vault))
+        del st.session_state.audio_vault[oldest]
+    message['audio_id']=audio_id
+    message.pop('audio',None)
+    st.session_state.active_audio_id=audio_id
+    st.session_state.autoplay_audio_id=audio_id
+
+
+def edit_task_content(task_id, title, description, day, start_time='', end_time='', end_date=''):
+    """제목/설명을 수정해도 업무·Google ID를 유지합니다. 재분석 시 사용자 수정을 보존합니다."""
+    if not title.strip():raise ValueError('업무 제목을 입력하세요.')
+    if day:google_time_body(day,start_time,end_time,end_date)
+    elif start_time or end_time or end_date:raise ValueError('시간/종료 날짜를 쓰려면 시작 날짜가 필요합니다.')
+    task=next(t for t in st.session_state.tasks if t['task_id']==task_id)
+    task.update(title=title.strip(),description=description.strip(),content_edited=True,edited=True,
+        deadline=day,start_time=start_time,end_time=end_time,end_date=end_date,date_error='',
+        date_resolution='사용자 지정',deadline_base='')
+    sync_calendar_tasks()
+
+
+def build_backup():
+    """텍스트/업무 기록만 내보냅니다. 음성·초안·메일 내역·인증정보는 제외합니다."""
+    checkpoint_current_meeting()
+    return {'version':3,'meetings':copy.deepcopy(st.session_state.uploads[:MAX_MEETING_HISTORY]),
+        'tasks':copy.deepcopy(st.session_state.tasks)}
+
+
+def validate_backup(data):
+    """가져온 데이터는 허용 필드만 복원하며 외부 일정 ID/동기화 실행 상태를 신뢰하지 않습니다."""
+    if not isinstance(data,dict) or data.get('version') not in (1,2,3):raise ValueError('지원하지 않는 백업 형식입니다.')
+    meetings=data.get('meetings',[]);raw_tasks=data.get('tasks',[])
+    if not isinstance(meetings,list) or not isinstance(raw_tasks,list) or len(raw_tasks)>1000:raise ValueError('백업 목록 형식을 확인하세요.')
+    clean_meetings=[];raw_snapshots=[]
+    for item in meetings[:MAX_MEETING_HISTORY]:
+        if not isinstance(item,dict) or not isinstance(item.get('text'),str):raise ValueError('회의 원문 형식을 확인하세요.')
+        identity=hashlib.sha256(item['text'].encode('utf-8')).hexdigest()
+        snap=item.get('snapshot',{})
+        if not isinstance(snap,dict):raise ValueError('회의 분석 형식을 확인하세요.')
+        messages=[]
+        for m in snap.get('messages',[])[-MAX_TURNS*2:]:
+            if not isinstance(m,dict) or m.get('role') not in ('user','assistant') or not isinstance(m.get('content'),str):raise ValueError('대화 형식이 올바르지 않습니다.')
+            messages.append({'role':m['role'],'content':m['content'],'message_id':uuid.uuid4().hex})
+        events=[]
+        for event in snap.get('events',[]):
+            if not isinstance(event,dict):raise ValueError('분석 업무 형식이 올바르지 않습니다.')
+            fields=['summary','description','owner','due_text','start_date','end_date','start_time','end_time','evidence']
+            clean={key:str(event.get(key,'')) for key in fields}
+            clean['has_clock_time']=bool(event.get('has_clock_time',False));events.append(clean)
+        summary=snap.get('summary','')
+        if not isinstance(summary,str):raise ValueError('요약 형식이 올바르지 않습니다.')
+        base=snap.get('meeting_date') or datetime.now(KST).date().isoformat();date.fromisoformat(base)
+        clean_meetings.append({'name':str(item.get('name','복원 회의록')),'path':identity,'meeting_id':identity,'text':item['text'],
+            'saved_at':str(item.get('saved_at','복원됨')),'snapshot':{'summary':summary,'messages':messages,'events':events,
+                'meeting_date':base,'analyzed_meeting_id':identity if summary else '', 'tasks':[]}})
+        if isinstance(snap.get('tasks'),list):raw_snapshots.extend(snap['tasks'])
+    task_fields=['task_id','title','description','source','meeting_id','meeting_name','deadline','due_text','start_time','end_time','end_date',
+        'evidence','date_resolution','deadline_base','extracted_title']
+    clean_tasks={}
+    for task in raw_tasks+raw_snapshots:
+        if not isinstance(task,dict) or not isinstance(task.get('task_id'),str) or not re.fullmatch(r'[a-f0-9]{32,64}',task['task_id']):raise ValueError('업무 ID 형식이 올바르지 않습니다.')
+        if task['task_id'] in clean_tasks:continue
+        if not isinstance(task.get('title'),str) or not task['title'].strip():raise ValueError('업무 제목을 확인하세요.')
+        clean={key:str(task.get(key,'')) for key in task_fields}
+        if clean['source'] not in ('manual','meeting'):raise ValueError('업무 출처 형식이 올바르지 않습니다.')
+        if clean['deadline']:google_time_body(clean['deadline'],clean['start_time'],clean['end_time'],clean['end_date'])
+        for key in ['done','trashed','edited','content_edited']:
+            if key in task and not isinstance(task[key],bool):raise ValueError('업무 상태 형식이 올바르지 않습니다.')
+            clean[key]=task.get(key,False)
+        source=next((m['text'] for m in clean_meetings if m['meeting_id']==clean['meeting_id']),'')
+        clean['evidence_verified']=bool(clean['evidence'] and source and re.sub(r'\s+','',clean['evidence']) in re.sub(r'\s+','',source))
+        clean.update(event_id='',sync_status='restored',sync_paused=True)
+        clean_tasks[clean['task_id']]=clean
+    for item in clean_meetings:
+        item['snapshot']['tasks']=[copy.deepcopy(t) for t in clean_tasks.values() if t.get('meeting_id')==item['meeting_id']]
+    return clean_meetings,list(clean_tasks.values())
+
+
+def restore_backup(data):
+    """검증 완료 후 병합합니다. 현재 업무가 우선이며 복원 자체는 외부 API를 호출하지 않습니다."""
+    meetings,tasks=validate_backup(data)
+    checkpoint_current_meeting()
+    existing={t['task_id']:t for t in st.session_state.tasks}
+    count=0
+    for task in tasks:
+        if task['task_id'] not in existing:existing[task['task_id']]=task;count+=1
+    st.session_state.tasks=list(existing.values())
+    known={m.get('meeting_id',m['path']):m for m in st.session_state.uploads}
+    for item in meetings:known.setdefault(item['meeting_id'],item)
+    st.session_state.uploads=list(known.values())[:MAX_MEETING_HISTORY]
+    if not st.session_state.get('meeting_id') and st.session_state.uploads:
+        select_meeting(st.session_state.uploads[0]['text'])
+    refresh_app_calendar()
+    return count
 
 
 # ========================================================================
@@ -694,14 +810,21 @@ def send_email(to, subject, body):
 
 # 기본/요청 수신자를 결정하고 현재 저장된 회의 요약을 발송합니다.
 def send_meeting_email(to, subject):
-    recipient = (to or "").strip() or DEFAULT_RECIPIENT.strip()
-    if not recipient:
-        return {"status": "failed", "error": "기본 수신 주소 또는 요청의 수신 주소를 지정하세요."}
-    if (not st.session_state.summary or st.session_state.get("analyzed_meeting_id") != st.session_state.get("meeting_id")):
-        summarized = summarize_meeting()
-        if summarized.get("status") == "failed":
-            return summarized
-    return send_email(recipient, subject or "회의 요약", st.session_state.summary)
+    """도구 호출은 초안을 준비할 뿐 발송하지 않습니다. 화면의 확인 버튼으로 발송합니다."""
+    if not st.session_state.summary or st.session_state.get('analyzed_meeting_id')!=st.session_state.get('meeting_id'):
+        result=summarize_meeting()
+        if result.get('status')=='failed':return result
+    body=st.session_state.summary
+    tasks=[t for t in st.session_state.tasks if t.get('meeting_id')==st.session_state.get('meeting_id') and not t.get('trashed')]
+    if tasks:
+        body+='\n\n[현재 업무 목록 · 사용자 수정 반영]\n'+'\n'.join(
+            f"- {t['title']} / {t.get('description','')} / 기한: {t.get('deadline') or t.get('due_text') or '미정'}" for t in tasks)
+    st.session_state.pending_email={'draft_id':uuid.uuid4().hex,'to':(to or '').strip() or DEFAULT_RECIPIENT,
+        'subject':subject or '회의 요약','body':body,'meeting_id':st.session_state.get('meeting_id',''),
+        'meeting_name':st.session_state.get('current_meeting_name','회의록')}
+    return {'status':'awaiting_confirmation','to':st.session_state.pending_email['to'],
+        'message':'초안만 준비되었습니다. 화면의 메일 미리보기에서 확인 후 발송 버튼을 눌러야 실제 발송됩니다.'}
+
 
 
 # 기존 상대 날짜 정책에 따라 다음 주 금요일을 계산합니다. 정책 자체는 이번에 바꾸지 않습니다.
@@ -829,7 +952,7 @@ def sync_calendar_tasks(force=False):
     registered, unchanged, skipped, failed = [], [], [], []
     attempted = False
     for task in st.session_state.tasks:
-        if task.get('trashed') or task.get('done') or not task.get('deadline'):
+        if task.get('sync_paused') or task.get('trashed') or task.get('done') or not task.get('deadline'):
             skipped.append({'summary':task['title'],'reason':'휴지통·완료 업무이거나 확정 날짜가 없습니다.'})
             continue
         fields = {key:task.get(key,'') for key in ('title','description','due_text','deadline','start_time','end_time','end_date')}
@@ -905,6 +1028,24 @@ def resolve_event_deadline(event, meeting_date):
     return result, rule or '날짜 미정 · 직접 지정 필요'
 
 
+def confirm_email(draft_id, recipient, subject, body):
+    """확인된 초안을 한 번 발송하고 성공/실패 내역을 모델 응답과 독립적으로 기록합니다."""
+    draft=st.session_state.pending_email
+    if not draft or draft['draft_id']!=draft_id:return {'status':'failed','error':'유효한 초안이 없습니다.'}
+    previous=next((r for r in st.session_state.mail_history if r['draft_id']==draft_id and r['status'] in ('success','sending')),None)
+    if previous:return {'status':'already_processed'}
+    if not recipient.strip() or '@' not in recipient or any(c in recipient+subject for c in '\r\n'):
+        return {'status':'failed','error':'수신 주소와 제목을 확인하세요.'}
+    record={'draft_id':draft_id,'to':recipient.strip(),'subject':subject,'body':body,
+        'meeting_name':draft.get('meeting_name',''),'sent_at':datetime.now(KST).isoformat(),'status':'sending'}
+    st.session_state.mail_history.insert(0,record)
+    st.session_state.mail_history=st.session_state.mail_history[:MAX_MAIL_HISTORY]
+    result=send_email(recipient.strip(),subject,body)
+    record.update(status=result['status'],error=result.get('error',''))
+    if result['status']=='success':st.session_state.pending_email=None
+    return result
+
+
 # ========================================================================
 # 블록 08 | 음성 생성·재생
 # 완성된 텍스트를 Gemini로 낭독하고 브라우저에서 재생합니다. 즉시 음성 재생 기능을 유지합니다.
@@ -958,47 +1099,34 @@ async def live_speak(text):
 
 # 저장된 음성을 브라우저에서 재생합니다. 중복 재생 방지용 상태를 사용합니다.
 def render_voice():
-    autoplay_voice = st.session_state.pop("autoplay_voice", False)
-    last_voice = max(
-        (index for index, message in enumerate(st.session_state.messages) if message.get("audio")),
-        default=-1,
-    )
-    voice_player = st.components.v2.component(
-        "able_voice",
-        js="""
-        export default function(component) {
-          if (!window.__ableUnlock) {
-            window.__ableUnlock = true;
-            window.__ableCtx = new AudioContext();
-            document.addEventListener("pointerdown", () => {
-              if (window.__ableCtx && window.__ableCtx.state !== "running") {
-                window.__ableCtx.resume();
-              }
-            }, true);
-          }
-          const data = component.data || {};
-          if (!data.wav || window.__ablePlayed === data.token) return;
-          window.__ablePlayed = data.token;
-          const ctx = window.__ableCtx;
-          const binary = atob(data.wav);
-          const bytes = new Uint8Array(binary.length);
-          for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-          ctx.decodeAudioData(bytes.buffer.slice(0)).then((buffer) => {
-            const source = ctx.createBufferSource();
-            source.buffer = buffer;
-            source.connect(ctx.destination);
-            source.start(0);
-          });
-        }
-        """,
-    )
-    play_wav = ""
-    play_token = 0
-    if autoplay_voice and last_voice >= 0:
-        spoken = st.session_state.messages[last_voice]
-        play_wav = base64.b64encode(spoken["audio"]).decode("ascii")
-        play_token = spoken.get("voice_token", 0)
-    voice_player(data={"wav": play_wav, "token": play_token}, key="able_voice_player", height=0)
+    """기본 플레이어 하나로 자동 재생·일시정지·재개·탐색을 제공합니다."""
+    vault=st.session_state.audio_vault
+    if not vault:return
+    active=st.session_state.get('active_audio_id')
+    if active not in vault:active=next(reversed(vault))
+    options=list(reversed(vault))
+    with st.container(border=True):
+        st.caption(f'답변 음성 · 최근 {MAX_AUDIO_ITEMS}개 / 총 {MAX_AUDIO_BYTES//1024//1024}MB 이내 · 현재 세션 보관')
+        chosen=st.selectbox('다시 들을 답변',options,index=options.index(active),
+            format_func=lambda key:vault[key]['created_at'][11:19]+' · '+vault[key]['label'],key='audio_pick_'+active)
+        if chosen!=active:
+            st.session_state.active_audio_id=chosen
+            st.session_state.autoplay_audio_id=chosen
+            st.rerun()
+        autoplay=st.session_state.pop('autoplay_audio_id','')==active
+        st.audio(vault[active]['data'],format='audio/wav',autoplay=autoplay)
+        st.caption('플레이어에서 일시정지/계속 재생이 가능합니다. 재생 막대를 맨 앞으로 옮기면 처음부터 들을 수 있습니다.')
+        st.download_button('이 음성 다운로드',vault[active]['data'],file_name='answer.wav',mime='audio/wav',key='audio_download_'+active)
+
+
+
+def speak_message(message):
+    """새 음성 생성만 Gemini를 호출합니다. 다시 듣기는 보관된 음성을 사용합니다."""
+    try:
+        wav=asyncio.run(live_speak(message['content']))
+        cache_answer_audio(message,wav)
+    except Exception:
+        st.session_state.voice_error='음성 생성에 실패했습니다. 텍스트 답변은 유지됩니다.'
 
 
 # ========================================================================
@@ -1065,28 +1193,48 @@ def ask_assistant(user_text):
 
 # 텍스트/음성을 요청으로 합치고 답변·음성을 생성한 다음 화면을 다시 실행합니다.
 def run_request(request_text, audio_value):
-    parts = []
-    if request_text and request_text.strip():
-        parts.append(request_text.strip())
+    parts=[]
+    if request_text and request_text.strip():parts.append(request_text.strip())
     if audio_value is not None:
-        transcript = client.audio.transcriptions.create(
-            model="whisper-1",
-            file=("audio.wav", audio_value, "audio/wav"),
-        )
-        if transcript.text.strip():
-            parts.append(transcript.text.strip())
+        transcript=client.audio.transcriptions.create(model='whisper-1',file=('audio.wav',audio_value,'audio/wav'))
+        if transcript.text.strip():parts.append(transcript.text.strip())
     if not parts:
-        st.warning("음성이나 텍스트로 요청해 주세요.")
-        return
-    with st.spinner("답변을 준비하고 음성으로 읽고 있습니다..."):
-        answer = ask_assistant("\n".join(parts))
-        try:
-            st.session_state.messages[-1]["audio"] = asyncio.run(live_speak(answer))
-            st.session_state.voice_token = st.session_state.get("voice_token", 0) + 1
-            st.session_state.messages[-1]["voice_token"] = st.session_state.voice_token
-            st.session_state.autoplay_voice = True
-        except Exception as e:
-            st.session_state.voice_error = str(e)
+        st.warning('음성이나 텍스트로 요청하세요.');return
+    with st.spinner('답변과 음성을 준비하고 있습니다...'):
+        ask_assistant('\n'.join(parts))
+        message=st.session_state.messages[-1]
+        message.setdefault('message_id',uuid.uuid4().hex)
+        speak_message(message)
+    checkpoint_current_meeting()
+    st.rerun()
+
+
+
+def briefing_text():
+    """현재 업무 데이터로만 작성하며 우선순위/날짜를 추측하지 않습니다."""
+    today=datetime.now(KST).date()
+    live=[t for t in st.session_state.tasks if not t.get('done') and not t.get('trashed')]
+    groups={'오늘 마감':[],'기한 초과':[],'7일 이내 마감':[],'날짜 미정':[]}
+    for task in live:
+        if not task.get('deadline'):groups['날짜 미정'].append(task);continue
+        day=date.fromisoformat(task['deadline'])
+        if day==today:groups['오늘 마감'].append(task)
+        elif day<today:groups['기한 초과'].append(task)
+        elif day<=today+timedelta(days=7):groups['7일 이내 마감'].append(task)
+    lines=[f"{today.isoformat()} 업무 브리핑입니다. 미완료 업무는 총 {len(live)}개입니다."]
+    for name,tasks in groups.items():
+        lines.append(f'{name}: {len(tasks)}개.')
+        lines.extend('- '+t['title'] for t in sorted_tasks(tasks)[:5])
+        if len(tasks)>5:lines.append(f'외 {len(tasks)-5}개입니다.')
+    return '\n'.join(lines)
+
+
+def run_briefing():
+    message={'role':'assistant','content':briefing_text(),'message_id':uuid.uuid4().hex}
+    st.session_state.messages.append(message)
+    st.session_state.messages=st.session_state.messages[-MAX_TURNS*2:]
+    speak_message(message)
+    checkpoint_current_meeting()
     st.rerun()
 
 
@@ -1177,26 +1325,27 @@ APP_STYLE = """
 
 # 대화를 표시하고 입력을 받아 공통 run_request로 전달합니다.
 def render_chat(placeholder):
-    if st.session_state.get("voice_error"):
-        st.error(st.session_state.pop("voice_error"))
-    st.markdown('<div class="chat-heading"><span>💬</span><b>AIVLE AI 채팅</b><span class="chat-more">⛶ &nbsp; ⋮</span></div>', unsafe_allow_html=True)
-    if not st.session_state.messages:
-        st.markdown(
-            '<div class="welcome-bubble">안녕하세요!<br>AIVLE입니다. 👋<br>'
-            '<small>업무, 회의, 일정 등 궁금한 내용을<br>자유롭게 물어보세요.</small></div>',
-            unsafe_allow_html=True,
-        )
+    if st.session_state.get('voice_error'):st.warning(st.session_state.pop('voice_error'))
+    st.markdown('### AIVLE AI 채팅')
+    if not st.session_state.messages:st.caption('회의·업무를 질문하거나 음성으로 요청하세요.')
     for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.write(message["content"])
-    with st.form("chat_form"):
-        chat_text = st.text_input("채팅", placeholder=placeholder, label_visibility="collapsed")
-        chat_submit = st.form_submit_button("보내기")
-    if chat_submit:
-        try:
-            run_request(chat_text, None)
-        except Exception as e:
-            st.error(str(e))
+        message.setdefault('message_id',uuid.uuid4().hex)
+        with st.chat_message(message['role']):
+            st.write(message['content'])
+            audio_id=message.get('audio_id')
+            if audio_id and audio_id in st.session_state.audio_vault:
+                if st.button('이 답변 다시 듣기',key='relisten_'+message['message_id']):
+                    st.session_state.active_audio_id=audio_id
+                    st.session_state.autoplay_audio_id=audio_id
+                    st.rerun()
+            elif audio_id:st.caption('이 답변의 음성은 보관 한도 초과로 정리되었습니다.')
+    with st.form('chat_form'):
+        text=st.text_input('채팅',placeholder=placeholder,label_visibility='collapsed')
+        submitted=st.form_submit_button('보내기')
+    if submitted:
+        try:run_request(text,None)
+        except Exception:st.error('요청 처리에 실패했습니다. 서비스 설정과 연결 상태를 확인하세요.')
+
 
 
 # 페이지 이동과 연결 상태를 표시합니다. 블록 2의 발신/기본 수신 설정을 표시합니다.
@@ -1239,6 +1388,8 @@ def page_heading(icon, title, description):
 
 
 def render_home():
+    if st.button('오늘의 업무 음성 브리핑',key='today_briefing'):
+        run_briefing()
     # 홈에서도 회의 요약 화면과 같은 업로드·기록 선택 기능을 제공합니다.
     with st.container(border=True):
         render_meeting_picker('home')
@@ -1321,6 +1472,7 @@ def render_home():
 # 업무·진행률·완료 체크·수동 추가 UI입니다. tasks와 앱 일정이 변경될 수 있습니다.
 def render_tasks():
     page_heading('☑','내 업무','모든 회의의 업무를 누적하고 완료·휴지통으로 정리합니다.')
+    render_task_editor()
     tasks = st.session_state.tasks
     live = [t for t in tasks if not t.get('trashed')]
     done = sum(bool(t.get('done')) for t in live)
@@ -1360,8 +1512,9 @@ def render_tasks():
             st.caption('출처: '+(task.get('meeting_name') or '직접 추가')+' · '+(dday_label(task.get('deadline','')) or '날짜 미정'))
             if task.get('due_text'):st.caption('기한 원문: '+task['due_text'])
             if task.get('date_resolution'):st.caption('날짜 해석: '+task['date_resolution']+' · 기준일 '+task.get('deadline_base',''))
-            st.caption('Google: '+{'synced':'연동 완료','failed':'연동 실패','local':'미등록'}.get(task.get('sync_status'),'미등록'))
+            st.caption('Google: '+{'synced':'연동 완료','failed':'연동 실패','local':'미등록','restored':'복원됨 · 연동 보류'}.get(task.get('sync_status'),'미등록'))
             if task.get('sync_error'):st.warning(task['sync_error'])
+            render_evidence(task)
     if any(t.get('sync_status')=='failed' and not t.get('trashed') and not t.get('done') for t in tasks):
         if st.button('Google 연동 실패 업무 재시도'):
             sync_calendar_tasks(force=True);st.rerun()
@@ -1442,11 +1595,7 @@ def render_meeting_picker(location):
         if not st.session_state.uploads:
             st.caption('업로드한 회의록이 없습니다.')
         else:
-            checkpoint_current_meeting()
-            # 다운로드한 기록에는 API 키·토큰·음성 바이트를 포함하지 않습니다.
-            archive = {'version':2,'meetings':st.session_state.uploads[:MAX_MEETING_HISTORY], 'tasks':st.session_state.tasks}
-            st.download_button('회의 내역 보관용 다운로드',json.dumps(archive,ensure_ascii=False,indent=2),
-                file_name='meeting_history.json',mime='application/json',key='history_export_'+location)
+            st.caption('기록 보관·복원은 상단의 기록 백업 다운로드 · 복원에서 이용하세요.')
 
 
 def render_meeting_date(location):
@@ -1467,6 +1616,89 @@ def render_meeting_date(location):
         st.rerun()
 
 
+def render_task_editor():
+    live={t['task_id']:t for t in st.session_state.tasks if not t.get('trashed')}
+    if not live:return
+    with st.expander('업무 제목·내용·기한 수정'):
+        task_id=st.selectbox('수정할 업무',list(live),format_func=lambda key:live[key]['title']+' · '+live[key].get('meeting_name',''),key='content_edit_pick')
+        task=live[task_id]
+        revision=hashlib.sha256(json.dumps({k:task.get(k,'') for k in ('title','description','deadline','start_time','end_time','end_date')},sort_keys=True).encode()).hexdigest()[:12]
+        with st.form('content_edit_'+task_id+'_'+revision):
+            title=st.text_input('업무 제목',value=task['title'])
+            description=st.text_area('해야 할 일',value=task.get('description',''))
+            day=st.date_input('마감/시작 날짜 (미정이면 비움)',value=date.fromisoformat(task['deadline']) if task.get('deadline') else None)
+            start=st.text_input('시작 시각 HH:MM',value=task.get('start_time',''))
+            end=st.text_input('종료 시각 HH:MM',value=task.get('end_time',''))
+            end_day=st.date_input('종료 날짜 (선택)',value=date.fromisoformat(task['end_date']) if task.get('end_date') else None)
+            submitted=st.form_submit_button('업무 수정 저장')
+        if submitted:
+            try:edit_task_content(task_id,title,description,day.isoformat() if day else '',start.strip(),end.strip(),end_day.isoformat() if end_day else '')
+            except ValueError as error:st.error(str(error))
+            else:st.rerun()
+        st.caption('기한을 지워도 기존 Google 일정은 자동 삭제하지 않습니다. 수정 내용은 재분석으로 덮어쓰지 않습니다.')
+
+
+def render_evidence(task):
+    with st.expander('업무 원문 근거 보기 · '+task['title']):
+        if task.get('source')=='manual':st.caption('사용자가 직접 추가한 업무입니다.')
+        elif task.get('evidence_verified'):
+            st.caption('원문 대조 완료 · '+task.get('meeting_name','회의록'))
+            st.write(task['evidence'])
+        else:st.warning('원문과 일치하는 근거가 확인되지 않았습니다. 해당 회의를 다시 분석하거나 원문을 확인하세요.')
+
+
+def render_mail_panel():
+    draft=st.session_state.pending_email
+    with st.expander('메일 미리보기 · 발송 내역',expanded=bool(draft)):
+        if draft:
+            st.caption('아직 발송되지 않았습니다. 초안 회의: '+draft.get('meeting_name',''))
+            with st.form('mail_preview_'+draft['draft_id']):
+                recipient=st.text_input('수신 주소',value=draft['to'])
+                subject=st.text_input('메일 제목',value=draft['subject'])
+                body=st.text_area('메일 본문',value=draft['body'],height=250)
+                send=st.form_submit_button('확인 후 발송')
+            if send:
+                result=confirm_email(draft['draft_id'],recipient,subject,body)
+                if result['status']=='success':
+                    st.success('메일을 발송했습니다.');st.rerun()
+                else:st.error(result.get('error','이미 처리한 요청입니다.'))
+            if st.button('초안 취소',key='cancel_draft_'+draft['draft_id']):
+                st.session_state.pending_email=None;st.rerun()
+        if st.session_state.mail_history:
+            index=st.selectbox('발송 내역 선택',list(range(len(st.session_state.mail_history))),
+                format_func=lambda i:st.session_state.mail_history[i]['sent_at'][:19]+' · '+st.session_state.mail_history[i]['to']+' · '+st.session_state.mail_history[i]['status'])
+            record=st.session_state.mail_history[index]
+            with st.container(border=True):
+                st.write(record['subject'])
+                st.write(record['body'])
+                if record.get('error'):st.warning(record['error'])
+        st.caption('발송 내역은 현재 세션에 보관합니다. 통신 오류 후 재시도 전 실제 수신 여부를 확인하세요.')
+
+
+def render_backup_panel():
+    with st.expander('기록 백업 다운로드 · 복원'):
+        data=json.dumps(build_backup(),ensure_ascii=False,indent=2)
+        st.download_button('회의·전체 업무 백업 다운로드',data,file_name='meeting_history.json',mime='application/json',key='full_backup_download')
+        uploaded=st.file_uploader('이전에 다운로드한 JSON 백업',type=['json'],key='backup_upload')
+        if uploaded is not None and st.button('백업 검증 후 복원'):
+            try:
+                raw=uploaded.getvalue()
+                if len(raw)>MAX_BACKUP_BYTES:raise ValueError('백업 파일은 20MB 이하만 복원할 수 있습니다.')
+                count=restore_backup(json.loads(raw.decode('utf-8-sig')))
+            except Exception:st.error('복원하지 못했습니다. 백업 버전·날짜·업무 형식과 용량을 확인하세요.')
+            else:
+                st.session_state.backup_notice=f'업무 {count}개 복원 완료. 복원한 업무의 Google 연동은 보류 상태입니다.'
+                st.rerun()
+        if st.session_state.get('backup_notice'):st.info(st.session_state.pop('backup_notice'))
+        st.caption('기존 업무·삭제 상태가 우선하며, 음성은 복원하지 않습니다. 복원만으로 메일이나 Google 일정이 실행되지 않습니다.')
+        paused=[t for t in st.session_state.tasks if t.get('sync_paused')]
+        if paused:
+            st.warning(f'복원 업무 {len(paused)}개의 자동 Google 연동이 보류되어 있습니다.')
+            if st.button('복원 업무의 Google 연동 허용'):
+                for task in paused:task['sync_paused']=False
+                sync_calendar_tasks(force=True);st.rerun()
+
+
 def main():
     """Streamlit이 실행할 시작점입니다. 함수 정의가 모두 끝난 뒤 호출합니다."""
     global client
@@ -1474,6 +1706,7 @@ def main():
     load_local_env()
     client = OpenAI()
     initialize_state()
+    initialize_feature_state()
     checkpoint_current_meeting()
     sync_calendar_tasks()
     checkpoint_current_meeting()
@@ -1483,6 +1716,8 @@ def main():
     if sync_failures:
         st.warning(f"Google Calendar 연동 실패 {len(sync_failures)}건 · 내 업무에서 재시도할 수 있습니다.")
     render_voice()
+    render_mail_panel()
+    render_backup_panel()
     with st.sidebar:
         render_sidebar()
     if st.session_state.page == "내 업무":
