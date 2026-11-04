@@ -1369,26 +1369,31 @@ def voice_script(text):
 
 # 저장된 음성을 브라우저에서 재생합니다. 중복 재생 방지용 상태를 사용합니다.
 def render_voice():
-    """기본 플레이어 하나로 자동 재생·일시정지·재개·탐색을 제공합니다."""
-    vault=st.session_state.audio_vault
-    if not vault:return
-    active=st.session_state.get('active_audio_id')
-    if active not in vault:active=next(reversed(vault))
-    options=list(reversed(vault))
-    with st.container(border=True):
-        st.caption(f'답변 음성 · 최근 {MAX_AUDIO_ITEMS}개 / 총 {MAX_AUDIO_BYTES//1024//1024}MB 이내 · 현재 세션 보관')
-        chosen=st.selectbox('다시 들을 답변',options,index=options.index(active),
-            format_func=lambda key:vault[key]['created_at'][11:19]+' · '+vault[key]['label'],key='audio_pick_'+active)
-        if chosen!=active:
-            st.session_state.active_audio_id=chosen
-            st.session_state.autoplay_audio_id=chosen
-            st.rerun()
-        # 자동 재생 표시를 지우지 않고 유지합니다. 화면이 다시 그려져도 플레이어 설정이 그대로라 멈추지 않고,
-        # Streamlit은 같은 플레이어를 한 번만 자동 재생하므로 다시 처음부터 재생되지도 않습니다.
-        autoplay=st.session_state.get('autoplay_audio_id','')==active
-        st.audio(vault[active]['data'],format='audio/wav',autoplay=autoplay)
-        st.caption('플레이어에서 일시정지/계속 재생이 가능합니다. 재생 막대를 맨 앞으로 옮기면 처음부터 들을 수 있습니다.')
-        st.download_button('이 음성 다운로드',vault[active]['data'],file_name='answer.wav',mime='audio/wav',key='audio_download_'+active)
+    """A stable compact player; history controls do not interrupt autoplay."""
+    vault = st.session_state.audio_vault
+    if not vault:
+        return
+    active = st.session_state.get('active_audio_id')
+    if active not in vault:
+        active = next(reversed(vault))
+        st.session_state.active_audio_id = active
+    with st.container(border=True, key='voice_player'):
+        st.caption('답변 음성 · ' + speech_text(vault[active]['label']).replace('\n', ' ')[:64])
+        st.audio(vault[active]['data'], format='audio/wav',
+                 autoplay=st.session_state.get('autoplay_audio_id', '') == active)
+        with st.expander('이전 음성 · 다운로드'):
+            options = list(reversed(vault))
+            chosen = st.selectbox('다시 들을 답변', options, index=options.index(active),
+                format_func=lambda key: vault[key]['created_at'][11:19] + ' · ' + speech_text(vault[key]['label']).replace('\n', ' ')[:55],
+                key='audio_pick_' + active)
+            if chosen != active:
+                st.session_state.active_audio_id = chosen
+                st.session_state.autoplay_audio_id = chosen
+                st.rerun()
+            st.download_button('음성 다운로드', vault[active]['data'], file_name='answer.wav',
+                               mime='audio/wav', key='audio_download_' + active)
+            st.caption(f'최근 {MAX_AUDIO_ITEMS}개 · 총 {MAX_AUDIO_BYTES // 1024 // 1024}MB까지 현재 세션에 보관합니다.')
+
 
 
 
@@ -1549,7 +1554,6 @@ def run_briefing():
     st.rerun()
 
 
-
 # ========================================================================
 # 블록 10 | 화면·앱 시작
 # APP_STYLE에서 화면 스타일을, render_*에서 화면 구성을 수정합니다.
@@ -1558,141 +1562,130 @@ def run_briefing():
 # ========================================================================
 
 APP_STYLE = """
-    <style>
-    :root { --mint: #10a985; --mint-dark: #078768; --mint-pale: #e6f8f2; --ink: #10172c; --muted: #687287; --line: #e7ebf0; }
-    * { font-family: "Pretendard", "Noto Sans KR", "Malgun Gothic", sans-serif; }
-    .stApp { background: linear-gradient(145deg, #fff 0%, #fff 70%, #f2fffa 100%); color: var(--ink); }
-    #MainMenu, footer { visibility: hidden; }
-    /* 기본 헤더를 숨기면 사이드바 다시 열기 버튼까지 사라질 수 있으므로 유지합니다. */
-    [data-testid="stHeader"] { visibility: visible !important; background: rgba(255,255,255,.95); }
-    [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"], [data-testid="stSidebarCollapseButton"] { visibility: visible !important; }
-    [data-testid="stAppViewContainer"] > .main { background: radial-gradient(ellipse 45% 12% at 88% 6%, #def8ef 0%, rgba(222,248,239,0) 80%); }
-    .block-container { max-width: 1510px; padding: 2rem 3.2rem 2.5rem; }
-    [data-testid="stSidebar"] { background: linear-gradient(180deg, #f7fffc, #effbf7); border-right: 1px solid #e5f2ed; }
-    [data-testid="stSidebar"] > div:first-child { padding: 1.65rem 1rem; }
-    [data-testid="stSidebar"] .stButton > button { min-height: 3.55rem; border: 0; border-radius: 14px; background: transparent; color: var(--ink); font-size: 1.04rem; font-weight: 700; text-align: left; padding-left: 1rem; margin: .15rem 0; }
-    [data-testid="stSidebar"] .stButton > button[kind="primary"] { background: #dff8ef; color: #079c78; }
-    [data-testid="stSidebar"] .stButton > button:hover { background: #eafaf4; color: var(--mint-dark); border: 0; }
-    .brand { display:flex; align-items:center; gap:.75rem; margin:.2rem .45rem 3rem; color:#081438; }
-    .brand-bot { width:3.2rem; height:3.2rem; display:grid; place-items:center; background:linear-gradient(145deg,#e8fff7,#c7f5e6); border-radius:1rem; font-size:1.8rem; box-shadow:0 4px 18px #bcebdd80; }
-    .brand strong { display:block; font-size:1.78rem; line-height:1; letter-spacing:-.04em; }
-    .brand span { display:block; margin-top:.35rem; font-size:.84rem; font-weight:700; }
-    .side-spacer { height: 37vh; min-height: 12rem; }
-    .side-footer { border-top:1px solid #e1eee9; padding:.95rem .55rem 0; }
-    .connection { display:flex; justify-content:space-between; align-items:center; font-weight:650; padding:.45rem 0; }
-    .connection em { background:#dcf8ef; color:#079b76; border-radius:1rem; font-style:normal; font-size:.76rem; padding:.26rem .54rem; }
-    .page-heading { display:flex; gap:1rem; align-items:flex-start; margin:.2rem 0 2rem; }
-    .heading-icon { font-size:2rem; padding-top:.2rem; color:#081438; }
-    .page-heading h1 { margin:0; font-size:2.05rem; letter-spacing:-.06em; color:#09112a; }
-    .page-heading p { margin:.35rem 0 0; font-size:1rem; color:#47526b; }
-    .home-hero { font-size:2.18rem; line-height:1.18; letter-spacing:-.065em; font-weight:700; color:#11162c; margin:0 0 2rem .4rem; }
-    .home-hero strong { color:#0aa77e; font-weight:800; }
-    [data-testid="stVerticalBlockBorderWrapper"] { border:1px solid var(--line); border-radius:1.35rem; background:rgba(255,255,255,.93); box-shadow:0 5px 16px rgba(29,51,75,.035); }
-    [data-testid="stVerticalBlockBorderWrapper"] > div { padding:.7rem 1rem; }
-    .card-title, .add-title, .recent-title, .summary-title { color:#11162c; letter-spacing:-.045em; margin:.2rem 0 .45rem; font-size:1.22rem; }
-    .date-chip { display:inline-block; margin:1.05rem 0 .45rem; border-radius:1rem; padding:.25rem .5rem; background:#e5faf2; font-size:.86rem; }
-    .schedule-item { display:grid; grid-template-columns:.55rem 1fr; gap:.45rem; align-items:center; font-weight:650; margin:.5rem 0; line-height:1.25; }
-    .schedule-item span { width:.48rem; height:.48rem; border-radius:50%; background:#39bfa2; }
-    .schedule-item small { grid-column:2; color:var(--muted); font-size:.78rem; font-weight:500; }
-    .empty-text { color:var(--muted); padding:1rem .2rem; }
-    .chat-heading { display:flex; align-items:center; gap:.55rem; padding:.25rem .1rem 1rem; border-bottom:1px solid var(--line); font-size:1.1rem; }
-    .chat-heading:first-letter { color:var(--mint); }
-    .chat-more { margin-left:auto; color:#0c1530; font-size:1.12rem; }
-    .welcome-bubble { margin:1.7rem .15rem 1rem 2.9rem; padding:1rem 1.1rem; border-radius:1rem; background:#f1f2f4; font-weight:650; line-height:1.55; }
-    .welcome-bubble small { font-size:.86rem; font-weight:500; }
-    [data-testid="stChatMessage"] { padding:.45rem 0; background:transparent; }
-    [data-testid="stForm"] { border:0; padding:0; }
-    [data-testid="stTextInput"] input { border:1px solid #e1e6ed; border-radius:.85rem; min-height:2.85rem; background:#fff; }
-    [data-testid="stTextInput"] input:focus { border-color:#62cdb4; box-shadow:0 0 0 1px #62cdb4; }
-    [data-testid="stSelectbox"] > div > div, [data-testid="stDateInput"] input { border-radius:.85rem; border-color:#e1e6ed; }
-    .stButton > button, [data-testid="stFormSubmitButton"] > button { border-radius:.85rem; font-weight:750; border-color:#b8e8da; color:#078c6c; }
-    [data-testid="stFormSubmitButton"] > button { background:linear-gradient(135deg,#3bb394,#76c9b4); color:white; border:0; min-height:2.7rem; }
-    [data-testid="stProgress"] > div > div > div > div { background:linear-gradient(90deg,#30aa8c,#8bd2bd); border-radius:99px; }
-    [data-testid="stProgress"] > div > div { background:#edf0f1; border-radius:99px; }
-    .progress-head { display:flex; justify-content:space-between; align-items:flex-start; font-size:1.03rem; font-weight:700; margin:.1rem 0 .55rem; }
-    .progress-head strong { display:inline-block; font-size:1.7rem; line-height:1.3; color:#079d78; letter-spacing:-.05em; }
-    .progress-head b { color:#3e475c; font-size:1.35rem; }
-    [data-testid="stRadio"] { margin:.75rem 0 1rem; }
-    [data-testid="stRadio"] label { background:#f6f8fa; border:1px solid #e6eaf0; border-radius:999px; padding:.45rem .88rem; font-weight:650; }
-    [data-testid="stRadio"] label:has(input:checked) { background:#e8f9f3; border-color:#49b89e; color:#078d6c; }
-    [data-testid="stRadio"] label div:first-child { display:none; }
-    [data-testid="stCheckbox"] { padding:.3rem .1rem; }
-    [data-testid="stCheckbox"] label { font-size:1.08rem; font-weight:700; color:#12182d; }
-    .deadline { display:inline-block; white-space:nowrap; text-align:center; padding:.31rem .65rem; border-radius:999px; background:#eef9f4; color:#159879; font-weight:750; margin-top:.25rem; }
-    .deadline.due { background:#fff2e4; color:#b75c10; }
-    .add-title { color:#0a9d7a; }
-    .upload-intro { text-align:center; padding:2.2rem .4rem 1rem; border:1px dashed #cbd7df; border-radius:1rem; background:linear-gradient(140deg,#fff,#f8fcfd); color:#078f6e; font-size:2.5rem; }
-    .upload-intro b { display:block; margin-top:.6rem; font-size:1.15rem; color:#14192d; }
-    .upload-intro small { display:block; margin:.25rem; color:#657087; font-size:.85rem; }
-    [data-testid="stFileUploader"] { margin:1rem auto; max-width:14rem; }
-    [data-testid="stFileUploader"] section { border:0; background:transparent; }
-    [data-testid="stFileUploader"] section button { color:#078f6e; border-color:#c8e9df; border-radius:999px; }
-    .summary-content { white-space:pre-wrap; line-height:1.7; color:#242b3e; background:#fbfcfd; border-radius:.8rem; padding:.8rem; }
-    .summary-task { padding:.4rem 0; font-weight:650; }.summary-task small { color:var(--muted); font-weight:500; margin-left:.4rem; }
-    .summary-placeholder { min-height:13rem; display:grid; place-items:center; text-align:center; color:#758095; line-height:1.7; }
-    .form-label { color:#788297; font-size:.78rem; margin-bottom:.55rem; }
-    @media (max-width: 900px) { .block-container { padding:1rem; } .side-spacer { height:5rem; min-height:0; } .home-hero { font-size:1.8rem; } }
-    </style>
-    """
+<style>
+@import url('https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/static/pretendard.css');
+:root { --mint:#087f69; --ink:#203047; --muted:#5c697a; --line:#e3e9ee; }
+html, body, .stApp, .stMarkdown, input, textarea, button, label, select { font-family:'Pretendard','Noto Sans KR','Malgun Gothic',sans-serif; }
+.stApp { background:#f5f7fa; color:var(--ink); }
+.block-container { max-width:1440px; padding:4.5rem 2.2rem 3rem; }
+[data-testid="stHeader"] { background:rgba(245,247,250,.96); }
+#MainMenu, footer { visibility:hidden; }
+[data-testid="stSidebar"] { background:#f0f7f4; border-right:1px solid #dce8e1; }
+[data-testid="stSidebar"] [data-testid="stVerticalBlockBorderWrapper"], [data-testid="stSidebar"] [data-testid="stLayoutWrapper"] > [data-testid="stVerticalBlock"] { box-shadow:none; }
+[data-testid="stSidebar"] .stButton button { width:100%; text-align:left; justify-content:flex-start; font-weight:600; border-color:transparent; background:transparent; color:#34465a; padding:.55rem .8rem; min-height:42px; }
+[data-testid="stSidebar"] .stButton button[kind="primary"] { background:#d8eee5; color:#075e4d; border-color:#c6e3d7; }
+[data-testid="stSidebar"] .stButton button:hover { background:#e3f1ea; }
+.brand { display:flex; gap:12px; align-items:center; margin:0 0 22px; }
+.brand-bot { background:#087f69; color:white; border-radius:14px; width:44px; height:44px; display:grid; place-items:center; font-size:25px; font-weight:800; }
+.brand strong { display:block; font-size:26px; letter-spacing:-1px; }
+.brand span { display:block; color:#617165; font-size:13px; }
+.page-heading { display:flex; align-items:flex-start; gap:12px; margin:0 0 14px; }
+.heading-icon { font-size:27px; color:var(--mint); padding-top:3px; }
+.page-heading h1 { font-size:30px; font-weight:750; letter-spacing:-.8px; padding:0; line-height:1.3; }
+.page-heading p { font-size:15px; color:var(--muted); margin:5px 0 0; }
+[data-testid="stVerticalBlockBorderWrapper"] { background:white; border-radius:14px; border-color:var(--line); }
+[data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"] { box-shadow:0 2px 6px #20304704; }
+.stMarkdown p, .stMarkdown li { font-size:16px; line-height:1.7; }
+.stMarkdown p { margin-bottom:.65rem; }
+.stMarkdown li p { margin-bottom:.25rem; }
+.stMarkdown h1, .stMarkdown h2, .stMarkdown h3 { letter-spacing:-.5px; }
+[data-testid="stChatMessage"] { border-radius:12px; padding:14px; }
+[data-testid="stChatMessage"] h1, [data-testid="stChatMessage"] h2, [data-testid="stChatMessage"] h3 { font-size:20px; padding:.4rem 0; }
+[data-testid="stCaptionContainer"] p { color:var(--muted); font-size:13px; line-height:1.6; }
+.stButton button, [data-testid="stFormSubmitButton"] button, .stDownloadButton button { border-radius:9px; min-height:40px; }
+.stButton button[kind="primary"], [data-testid="stFormSubmitButton"] button[kind="primary"] { background:#087f69; color:white; border-color:#087f69; }
+[data-testid="stTextInput"] input, [data-testid="stTextArea"] textarea { background:white; }
+[data-testid="stRadio"] [role="radiogroup"] { gap:8px; }
+[data-testid="stRadio"] label { border:1px solid #dfe6ec; border-radius:9px; padding:7px 12px; background:white; }
+[data-testid="stRadio"] label:has(input:checked) { background:#e4f3ec; border-color:#91c7b2; }
+[data-testid="stMetricValue"] { font-size:27px; font-weight:700; }
+[data-testid="stCheckbox"] label p { font-weight:650; }
+[data-testid="stFileUploader"] { margin:0; max-width:none; }
+[data-testid="stFileUploaderDropzoneInstructions"] { display:none; }
+[data-testid="stFileUploaderDropzone"] button { font-size:0; }
+[data-testid="stFileUploaderDropzone"] button::after { content:'파일 선택'; font-size:14px; }
+[data-testid="stExpander"] summary p { font-size:14px; }
+[data-testid="stForm"] { border-color:#e3e9ee; border-radius:12px; }
+@media(max-width:900px) { .block-container { padding:4rem 1rem 2rem; } .page-heading h1 { font-size:25px; } }
+
+[class*="st-key-card_"], .st-key-calendar_card, .st-key-voice_player { background:#fff; border-color:#e3e9ee !important; border-radius:14px; }
+[data-testid="stSidebar"] [class*="st-key-card_"] { background:rgba(255,255,255,.65); }
+[data-testid="stSidebar"] button p { text-align:left; width:100%; }
+.st-key-card_summary h1, .st-key-card_summary h2, .st-key-card_summary h3 { font-size:21px; padding:.5rem 0; }
+[data-testid="stTabs"] [aria-selected="true"] { color:#087f69; }
+[data-testid="stTabs"] [data-baseweb="tab-highlight"] { background-color:#087f69; }
+</style>
+"""
 
 # 대화를 표시하고 입력을 받아 공통 run_request로 전달합니다.
 def render_chat(placeholder):
-    if st.session_state.get('voice_error'):st.warning(st.session_state.pop('voice_error'))
-    st.markdown('### AIVLE AI 채팅')
-    if not st.session_state.messages:st.caption('회의·업무를 질문하거나 음성으로 요청하세요.')
+    st.subheader('에이블에게 요청하기')
+    if st.session_state.get('voice_error'):
+        st.warning(st.session_state.pop('voice_error'))
+    if not st.session_state.messages:
+        st.info('회의를 요약하거나, 업무와 일정을 물어보세요. 글과 음성 모두 사용할 수 있습니다.')
     for message in st.session_state.messages:
-        message.setdefault('message_id',uuid.uuid4().hex)
+        message.setdefault('message_id', uuid.uuid4().hex)
         with st.chat_message(message['role']):
-            st.write(message['content'])
-            if message.get('wake'):st.caption("🔔 호출어 '에이블' 인식")
-            audio_id=message.get('audio_id')
+            st.markdown(readable_markdown(message['content']))
+            if message.get('wake'):
+                st.caption("호출어 ‘에이블’ 인식")
+            audio_id = message.get('audio_id')
             if audio_id and audio_id in st.session_state.audio_vault:
-                if message.get('voice_mode')=='script':
-                    st.caption('🔊 답변이 길어 업무 중심 낭독 대본으로 읽었습니다: '+message.get('voice_text',''))
-                if message.get('voice_engine')=='live':
-                    st.caption('🔊 음성 서버가 혼잡해 예비 방식으로 생성했습니다. 구간마다 목소리가 조금 다를 수 있습니다.')
-                if st.button('이 답변 다시 듣기',key='relisten_'+message['message_id']):
-                    st.session_state.active_audio_id=audio_id
-                    st.session_state.autoplay_audio_id=audio_id
+                if message.get('voice_mode') == 'script':
+                    with st.expander('실제로 읽은 내용'):
+                        st.write(message.get('voice_text', ''))
+                if message.get('voice_engine') == 'live':
+                    st.caption('예비 음성으로 재생합니다. 구간마다 목소리가 조금 다를 수 있습니다.')
+                if st.button('다시 듣기', key='relisten_' + message['message_id']):
+                    st.session_state.active_audio_id = audio_id
+                    st.session_state.autoplay_audio_id = audio_id
                     st.rerun()
-            elif audio_id:st.caption('이 답변의 음성은 보관 한도 초과로 정리되었습니다.')
-    with st.form('chat_form'):
-        text=st.text_input('채팅',placeholder=placeholder,label_visibility='collapsed')
-        submitted=st.form_submit_button('보내기')
+            elif audio_id:
+                st.caption('보관 기간이 지난 음성입니다. 답변 내용은 계속 볼 수 있습니다.')
+    with st.form('chat_form', clear_on_submit=True):
+        text = st.text_input('에이블에게 요청', placeholder=placeholder)
+        audio = st.audio_input('음성으로 요청')
+        submitted = st.form_submit_button('요청 보내기', type='primary', use_container_width=True)
     if submitted:
-        try:run_request(text,None)
-        except Exception:st.error('요청 처리에 실패했습니다. 서비스 설정과 연결 상태를 확인하세요.')
+        try:
+            run_request(text, audio)
+        except Exception:
+            st.error('요청 처리에 실패했습니다. 서비스 설정과 연결 상태를 확인하세요.')
+
 
 
 
 # 페이지 이동과 연결 상태를 표시합니다. 블록 2의 발신/기본 수신 설정을 표시합니다.
 def render_sidebar():
-    st.markdown(
-        '<div class="brand"><div class="brand-bot">🤖</div><div><strong>AIVLE</strong>'
-        '<span>AIVLE | AI 개인비서</span></div></div>',
-        unsafe_allow_html=True,
-    )
-    open_tasks = sum(not t.get("done") and not t.get("trashed") for t in st.session_state.tasks)
-    nav_items = (("⌂   홈", "홈"), (f"☑   내 업무     {open_tasks}", "내 업무"), ("▤   회의 요약", "회의 요약"))
-    for label, page in nav_items:
-        if st.button(label, key=f"nav_{page}", use_container_width=True, type="primary" if st.session_state.page == page else "secondary"):
-            st.session_state.page = page
-            st.rerun()
-    st.markdown('<div class="side-spacer"></div><div class="side-footer">', unsafe_allow_html=True)
-    st.markdown("👤 &nbsp; **마케팅팀 김 대리**")
-    st.caption(f"메일 발신: {saved_email()}")
-    st.caption(f"기본 수신: {DEFAULT_RECIPIENT}")
-    if os.getenv(MAIL_PASSWORD_SECRET):
-        st.caption("메일 인증정보 설정됨 · 실제 연결은 발송 시 확인")
-    else:
-        st.caption(f"메일 설정 필요: Secrets의 {MAIL_PASSWORD_SECRET}")
-    if (os.getenv("GOOGLE_TOKEN") or "").strip() or os.path.exists("token.json"):
-        st.markdown('<div class="connection">▣ &nbsp; 캘린더 <em>인증 설정됨</em></div>', unsafe_allow_html=True)
-    else:
-        st.markdown('<div class="connection">▣ &nbsp; 캘린더 <em>연결 필요</em></div>', unsafe_allow_html=True)
-    st.link_button('Google Calendar 열기', GOOGLE_CALENDAR_URL, use_container_width=True)
-    st.caption('웹 캘린더를 엽니다. 브라우저 계정과 앱의 Google 인증 계정이 같은지 확인하세요.')
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="brand"><div class="brand-bot">A</div><div><strong>AIVLE</strong><span>김 대리의 AI 개인비서</span></div></div>', unsafe_allow_html=True)
+    with st.container(border=True, key='card_sidebar_workspace'):
+        st.caption('WORKSPACE · 업무 공간')
+        count = sum(not t.get('done') and not t.get('trashed') for t in st.session_state.tasks)
+        for label, page in [('홈 · 캘린더', '홈'), (f'내 업무  ·  {count}', '내 업무'), ('회의 요약', '회의 요약')]:
+            if st.button(label, key='nav_' + page, use_container_width=True,
+                         type='primary' if st.session_state.page == page else 'secondary'):
+                st.session_state.page = page
+                st.session_state.pop('active_dialog', None)
+                st.rerun()
+    with st.container(border=True, key='card_sidebar_manage'):
+        st.caption('MANAGE · 연동과 기록')
+        for label, panel in [('Google Calendar 연결 진단', 'calendar'), ('메일 발송 내역', 'mail'), ('기록 백업 · 복원', 'backup')]:
+            if st.button(label, key='manage_' + panel, use_container_width=True):
+                st.session_state.active_dialog = panel
+        st.link_button('Google Calendar 열기 ↗', GOOGLE_CALENDAR_URL, use_container_width=True)
+    with st.container(border=True, key='card_sidebar_profile'):
+        st.caption('PROFILE · 내 계정')
+        st.markdown('**마케팅팀 김 대리**')
+        with st.expander('메일 · 인증 설정 정보'):
+            st.caption('메일 발신: ' + saved_email())
+            st.caption('기본 수신: ' + DEFAULT_RECIPIENT)
+            st.caption('메일 인증정보 설정됨' if os.getenv(MAIL_PASSWORD_SECRET) else '메일 인증정보 설정 필요')
+            configured = bool((os.getenv('GOOGLE_TOKEN') or '').strip() or os.path.exists('token.json'))
+            st.caption('캘린더 인증정보 설정됨' if configured else '캘린더 인증정보 설정 필요')
+            st.caption('인증정보 설정 여부이며, 실제 연결 결과는 연결 진단에서 확인하세요.')
+    st.caption('기록은 현재 접속 동안 보관됩니다. 필요한 기록은 백업해 주세요.')
+
 
 
 # 페이지 제목과 안내 문구를 표시하는 공통 UI입니다.
@@ -1705,188 +1698,105 @@ def page_heading(icon, title, description):
 
 
 def render_home():
-    has_pending=any(not t.get('done') and not t.get('trashed') for t in st.session_state.tasks)
-    briefing_requested=st.button('오늘의 업무 음성 브리핑',key='today_briefing',disabled=not has_pending)
-    if not has_pending:
-        st.caption('미완료 업무가 없어 브리핑이 비활성화되어 있습니다. 업무를 먼저 추가하세요.')
-    # 홈에서도 회의 요약 화면과 같은 업로드·기록 선택 기능을 제공합니다.
-    with st.container(border=True):
-        render_meeting_picker('home')
-    main, chat = st.columns([3.05, 1.25], gap="large")
-    with main:
-        st.markdown('<div class="home-hero">AIVLE과 함께<br>업무를 <strong>더 효율적으로</strong> 관리하세요.</div>', unsafe_allow_html=True)
-        month, week = st.columns([3, 1], gap="medium")
-        with month:
-            with st.container(border=True):
-                calendar(
-                    events=st.session_state.calendar_tasks,
-                    options={"initialView": "dayGridMonth", "locale": "ko", "timeZone": "local", "displayEventTime": True, "eventTimeFormat": {"hour": "2-digit", "minute": "2-digit", "hour12": False}, "height": 485, "headerToolbar": {"left": "prev,next", "center": "title", "right": "today"}},
-                    key="work_calendar",
-                )
-        with week:
-            with st.container(border=True):
-                today = datetime.now(KST).date()
-                monday = today - timedelta(days=today.weekday())
-                sunday = monday + timedelta(days=6)
-                st.markdown("<h3 class='card-title'>이번 주 일정</h3>", unsafe_allow_html=True)
-                st.caption(f"{monday.month}.{monday.day}({ '월화수목금토일'[monday.weekday()] }) – {sunday.month}.{sunday.day}({ '월화수목금토일'[sunday.weekday()] })")
-                week_events = [
-                    event for event in st.session_state.calendar_tasks
-                    if monday.isoformat() <= event_day(event) <= sunday.isoformat()
-                ]
-                week_events.sort(key=lambda event: (event_day(event), event.get("start_time") or "99:99"))
-                if not week_events:
-                    st.markdown('<p class="empty-text">이번 주 일정이 없습니다.</p>', unsafe_allow_html=True)
-                current = ""
-                for event in week_events:
-                    day = event_day(event)
-                    if day != current:
-                        current = day
-                        parsed = date.fromisoformat(day)
-                        st.markdown(f"<b class='date-chip'>{parsed.month}.{parsed.day}({ '월화수목금토일'[parsed.weekday()] })</b>", unsafe_allow_html=True)
-                    label = time_label(event)
-                    st.markdown(f"<div class='schedule-item'><span></span>{event['title']}<small>{label}</small></div>", unsafe_allow_html=True)
-        with st.expander("일정 수정 · 날짜 미정 업무에도 날짜 지정 가능"):
-            choices = [t['task_id'] for t in st.session_state.tasks if not t.get('done') and not t.get('trashed')]
-            by_id = {t['task_id']:t for t in st.session_state.tasks}
-            if choices:
-                # 종속 입력값 갱신을 위해 일정 선택은 form 밖에 둡니다.
-                picked = st.selectbox("수정할 업무", choices,
-                    format_func=lambda key: by_id[key]['title'] + ' · ' + key[:6])
-                task = by_id[picked]
-                with st.form('edit_' + picked):
-                    day = st.date_input('시작/마감 날짜', value=date.fromisoformat(task['deadline']) if task.get('deadline') else datetime.now(KST).date())
-                    start_time = st.text_input('시작 시각 (HH:MM, 비우면 종일)', value=task.get('start_time',''))
-                    end_time = st.text_input('종료 시각 (HH:MM, 생략하면 1시간)', value=task.get('end_time',''))
-                    end_day = st.date_input('종료 날짜 (선택, 종일 일정은 이 날짜 직전까지)', value=date.fromisoformat(task['end_date']) if task.get('end_date') else None)
-                    saved = st.form_submit_button('일정 저장')
-                if saved:
-                    try:
-                        edit_task(picked,day.isoformat(),start_time.strip(),end_time.strip(),end_day.isoformat() if end_day else '')
-                    except ValueError as error:
-                        st.error(str(error))
-                    else:
-                        st.rerun()
-            else:
-                st.caption('업무가 생성되면 날짜와 시간을 지정할 수 있습니다.')
-        with st.container(border=True):
-            with st.form("home_request"):
-                input_col, action_col = st.columns([5, 1])
-                with input_col:
-                    request_text = st.text_input("요청", placeholder="회의를 요약하고, 내 업무를 알려줘.", label_visibility="collapsed")
-                    audio_value = st.audio_input("음성으로 요청")
-                with action_col:
-                    st.markdown("<div class='form-label'>AI 요청</div>", unsafe_allow_html=True)
-                    submit = st.form_submit_button("✦ 분석하기", use_container_width=True)
-        if submit:
-            try:
-                run_request(request_text, audio_value)
-            except Exception as e:
-                st.error(str(e))
-    with chat:
-        with st.container(border=True):
-            render_chat("궁금한 내용을 입력하세요...")
-
-    # 먼저 홈 화면 전체를 표시한 뒤 음성을 기다려 빈 화면처럼 보이지 않게 합니다.
-    if briefing_requested:
+    pending = [t for t in st.session_state.tasks if not t.get('done') and not t.get('trashed')]
+    today = datetime.now(KST).date().isoformat()
+    with st.container(border=True, key='card_metrics'):
+        a, b, c, d = st.columns([1, 1, 1, 1.4])
+        a.metric('진행 중', f'{len(pending)}개')
+        b.metric('오늘 마감', f"{sum(t.get('deadline') == today for t in pending)}개")
+        c.metric('날짜 미정', f"{sum(not t.get('deadline') for t in pending)}개")
+        with d:
+            st.caption('오늘의 업무를 음성으로 확인하세요')
+            briefing = st.button('업무 브리핑 듣기', disabled=not pending, use_container_width=True)
+    render_meeting_context('home')
+    with st.container(border=True, key='card_chat'):
+        render_chat('예: 에이블, 회의를 요약하고 내 업무를 알려줘')
+    if briefing:
         run_briefing()
+
 
 
 
 # 업무·진행률·완료 체크·수동 추가 UI입니다. tasks와 앱 일정이 변경될 수 있습니다.
 def render_tasks():
-    page_heading('☑','내 업무','모든 회의의 업무를 누적하고 완료·휴지통으로 정리합니다.')
-    render_task_editor()
     tasks = st.session_state.tasks
-    live = [t for t in tasks if not t.get('trashed')]
-    done = sum(bool(t.get('done')) for t in live)
-    st.progress(done/len(live) if live else 0)
-    st.caption(f'전체 {len(live)}개 · 완료 {done}개 · 휴지통 {sum(bool(t.get("trashed")) for t in tasks)}개')
-    st.caption('최근 회의 내역에서 빠져도 업무는 남습니다. 현재 접속 세션 기준이며 영구 저장은 아닙니다.')
-    mode = st.radio('업무 상태',['진행 중','완료','전체','휴지통'],horizontal=True,key='task_mode')
-    origins = {'all':'모든 회의·수동 업무'}
+    counts = {'진행 중': sum(not t.get('done') and not t.get('trashed') for t in tasks),
+              '완료': sum(bool(t.get('done')) and not t.get('trashed') for t in tasks),
+              '전체': sum(not t.get('trashed') for t in tasks),
+              '휴지통': sum(bool(t.get('trashed')) for t in tasks)}
+    filters, action = st.columns([5, 1])
+    with filters:
+        mode = st.radio('업무 상태', list(counts), format_func=lambda value: f'{value} {counts[value]}',
+                        horizontal=True, key='task_mode', label_visibility='collapsed')
+    with action:
+        if st.button('＋ 업무 추가', type='primary', use_container_width=True):
+            st.session_state.active_dialog = 'add_task'
+    origins = {'all': '모든 회의 · 직접 추가'}
     for task in tasks:
         origin = task.get('meeting_id') or 'manual'
-        origins[origin] = task.get('meeting_name') or ('직접 추가' if origin=='manual' else '회의 '+origin[:6])
-    picked = st.selectbox('회의별 필터',list(origins),format_func=lambda key:origins[key],key='task_origin')
-    order = st.selectbox('정렬',['마감일순','가나다순'],key='task_sort')
-    visible = [t for t in tasks if (bool(t.get('trashed')) if mode=='휴지통' else not t.get('trashed'))]
-    if mode=='진행 중':visible=[t for t in visible if not t.get('done') and not t.get('trashed')]
-    if mode=='완료':visible=[t for t in visible if t.get('done')]
-    if picked!='all':visible=[t for t in visible if (t.get('meeting_id') or 'manual')==picked]
-    visible=sorted(visible,key=lambda t:t['title']) if order=='가나다순' else sorted_tasks(visible)
-    by_id={t['task_id']:t for t in visible}
-    selected=st.multiselect('여러 업무 선택',list(by_id),format_func=lambda key:by_id[key]['title']+' · '+(by_id[key].get('meeting_name') or '직접 추가'))
-    if selected and st.button('선택 업무 복원' if mode=='휴지통' else '선택 업무 휴지통 이동'):
-        for key in selected:set_task_trashed(key,mode!='휴지통')
-        st.rerun()
-    if not visible:st.info('표시할 업무가 없습니다.')
-    for task in visible:
-        with st.container(border=True):
-            if mode=='휴지통':
-                st.write(task['title'])
-                if st.button('복원',key='restore_'+task['task_id']):
-                    set_task_trashed(task['task_id'],False);st.rerun()
-            else:
-                checked=st.checkbox(task['title'],value=bool(task.get('done')),key='done_'+task['task_id'])
-                if checked!=task.get('done'):
-                    task['done']=checked;refresh_app_calendar();st.rerun()
-                if st.button('휴지통',key='trash_'+task['task_id']):
-                    set_task_trashed(task['task_id'],True);st.rerun()
-            st.caption('출처: '+(task.get('meeting_name') or '직접 추가')+' · '+(dday_label(task.get('deadline','')) or '날짜 미정'))
-            if task.get('due_text'):st.caption('기한 원문: '+task['due_text'])
-            if task.get('date_resolution'):st.caption('날짜 해석: '+task['date_resolution']+' · 기준일 '+task.get('deadline_base',''))
-            st.caption('Google: '+{'synced':'연동 완료','failed':'연동 실패','local':'미등록','restored':'복원됨 · 연동 보류'}.get(task.get('sync_status'),'미등록'))
-            if task.get('sync_error'):st.warning(task['sync_error'])
-            render_evidence(task)
-    if any(t.get('sync_status')=='failed' and not t.get('trashed') and not t.get('done') for t in tasks):
-        if st.button('Google 연동 실패 업무 재시도'):
-            sync_calendar_tasks(force=True);st.rerun()
-    st.caption('완료·휴지통 이동은 앱 표시를 정리하며 Google의 기존 일정을 자동 삭제하지 않습니다.')
-    with st.form('add_task_form'):
-        title=st.text_input('새로운 업무')
-        deadline=st.date_input('마감일',value=datetime.now(KST).date())
-        use_deadline=st.checkbox('날짜 확정 · 저장 시 Google 자동 연동',value=True)
-        added=st.form_submit_button('업무 추가')
-    if added:
-        if not title.strip():st.warning('업무를 입력하세요.')
-        else:
-            add_manual_task(title.strip(),deadline.isoformat() if use_deadline else '')
+        origins[origin] = task.get('meeting_name') or '직접 추가'
+    f1, f2, f3 = st.columns([3, 2, 1])
+    with f1:
+        if st.session_state.get('task_origin') not in origins:
+            st.session_state.task_origin = 'all'
+        picked = st.selectbox('회의', list(origins), format_func=lambda key: origins[key], key='task_origin')
+    with f2:
+        order = st.selectbox('정렬', ['마감일순', '가나다순'], key='task_sort')
+    with f3:
+        selection_mode = st.toggle('여러 업무 선택', key='task_selection_mode')
+    visible = [t for t in tasks if (bool(t.get('trashed')) if mode == '휴지통' else not t.get('trashed'))]
+    if mode == '진행 중': visible = [t for t in visible if not t.get('done')]
+    if mode == '완료': visible = [t for t in visible if t.get('done')]
+    if picked != 'all': visible = [t for t in visible if (t.get('meeting_id') or 'manual') == picked]
+    visible = sorted(visible, key=lambda t: t['title']) if order == '가나다순' else sorted_tasks(visible)
+    if selection_mode:
+        by_id = {t['task_id']: t for t in visible}
+        selected = st.multiselect('선택할 업무', list(by_id), format_func=lambda key: by_id[key]['title'], placeholder='업무 선택')
+        if selected and st.button('선택 업무 복원' if mode == '휴지통' else '선택 업무 휴지통 이동'):
+            for key in selected: set_task_trashed(key, mode != '휴지통')
             st.rerun()
+    if not visible:
+        st.info('표시할 업무가 없습니다. 필터를 바꾸거나 새 업무를 추가하세요.')
+    for task in visible:
+        render_task_row(task, mode == '휴지통')
+    if any(t.get('sync_status') == 'failed' and not t.get('done') and not t.get('trashed') for t in tasks):
+        if st.button('연동 실패 업무 다시 시도'):
+            sync_calendar_tasks(force=True)
+            st.rerun()
+    st.caption('완료하거나 휴지통으로 옮겨도 Google의 기존 일정은 유지됩니다.')
+
 
 
 
 # 회의록 업로드·선택·분석 결과·채팅 UI입니다. 업로드 시 기존 저장 함수를 호출합니다.
 def render_meetings():
-    load_saved_uploads()
-    page_heading("▤", "회의 요약", "회의록, 녹취 텍스트를 업로드하면 핵심 내용을 요약해드립니다.")
-    left, right = st.columns([1, 1.65], gap="large")
-    with left:
-        with st.container(border=True):
-            render_meeting_picker('meetings')
-    with right:
-        with st.container(border=True):
+    render_meeting_context('meetings')
+    summary_tab, tasks_tab, source_tab = st.tabs(['회의 요약', '배정 업무', '회의 원문'])
+    with summary_tab:
+        with st.container(border=True, key='card_summary'):
             if st.session_state.summary:
-                st.markdown("<h3 class='summary-title'>▤ &nbsp;회의 요약</h3>", unsafe_allow_html=True)
-                st.markdown(f'<div class="summary-content">{st.session_state.summary}</div>', unsafe_allow_html=True)
-                st.divider()
-                st.markdown("<h3 class='summary-title'>☑ &nbsp;김대리 업무</h3>", unsafe_allow_html=True)
-                if st.session_state.tasks:
-                    for task in [t for t in st.session_state.tasks if t.get('meeting_id')==st.session_state.meeting_id and not t.get('trashed')]:
-                        extra = task.get("due_text") or "마감일 미정"
-                        st.markdown(f"<div class='summary-task'>• &nbsp;{task['title']} <small>{extra}</small></div>", unsafe_allow_html=True)
-                else:
-                    st.markdown('<p class="empty-text">배정된 업무가 없습니다.</p>', unsafe_allow_html=True)
+                st.markdown(readable_markdown(st.session_state.summary))
             else:
-                st.markdown('<div class="summary-placeholder">회의록을 업로드한 뒤<br>채팅에서 요약을 요청해 주세요.</div>', unsafe_allow_html=True)
-            st.divider()
-            render_chat("회의 내용에 대해 추가 질문하세요...")
+                st.info('회의록을 선택한 뒤 아래에서 “회의를 요약해줘”라고 요청하세요.')
+    with tasks_tab:
+        current_tasks = [t for t in st.session_state.tasks if t.get('meeting_id') == st.session_state.meeting_id and not t.get('trashed')]
+        if not current_tasks: st.info('이 회의에서 추출한 업무가 없습니다.')
+        for task in sorted_tasks(current_tasks):
+            render_task_row(task, prefix='meeting_')
+    with source_tab:
+        if meeting_text():
+            st.text_area('선택한 회의록 원문', value=meeting_text(), height=420, disabled=True, key='meeting_source_view')
+        else:
+            st.info('회의록을 업로드하면 원문이 표시됩니다.')
+    with st.container(border=True, key='card_chat'):
+        render_chat('예: 확정된 사항과 검토 의견을 구분해서 알려줘')
+
 
 
 def render_meeting_picker(location):
     """홈/회의 화면이 같은 업로드·기록 복원 코드를 사용합니다."""
     st.markdown('**회의록 업로드 · 최근 회의**')
-    uploaded = st.file_uploader('UTF-8 회의록 (.txt, 최대 50MB)',type=['txt'],key='meeting_file_'+location)
+    uploaded = st.file_uploader('UTF-8 회의록 (.txt, 최대 50MB)',type=['txt'],max_upload_size=50,key='meeting_file_'+location)
     if uploaded is not None:
         raw = uploaded.getvalue()
         signature = uploaded.name + hashlib.sha256(raw).hexdigest()
@@ -1919,7 +1829,7 @@ def render_meeting_picker(location):
         if not st.session_state.uploads:
             st.caption('업로드한 회의록이 없습니다.')
         else:
-            st.caption('기록 보관·복원은 상단의 기록 백업 다운로드 · 복원에서 이용하세요.')
+            st.caption('기록 보관·복원은 사이드바의 기록 백업 · 복원에서 이용하세요.')
 
 
 def render_meeting_date(location):
@@ -1940,26 +1850,34 @@ def render_meeting_date(location):
         st.rerun()
 
 
-def render_task_editor():
-    live={t['task_id']:t for t in st.session_state.tasks if not t.get('trashed')}
-    if not live:return
-    with st.expander('업무 제목·내용·기한 수정'):
-        task_id=st.selectbox('수정할 업무',list(live),format_func=lambda key:live[key]['title']+' · '+live[key].get('meeting_name',''),key='content_edit_pick')
-        task=live[task_id]
-        revision=hashlib.sha256(json.dumps({k:task.get(k,'') for k in ('title','description','deadline','start_time','end_time','end_date')},sort_keys=True).encode()).hexdigest()[:12]
-        with st.form('content_edit_'+task_id+'_'+revision):
-            title=st.text_input('업무 제목',value=task['title'])
-            description=st.text_area('해야 할 일',value=task.get('description',''))
-            day=st.date_input('마감/시작 날짜 (미정이면 비움)',value=date.fromisoformat(task['deadline']) if task.get('deadline') else None)
-            start=st.text_input('시작 시각 HH:MM',value=task.get('start_time',''))
-            end=st.text_input('종료 시각 HH:MM',value=task.get('end_time',''))
-            end_day=st.date_input('종료 날짜 (선택)',value=date.fromisoformat(task['end_date']) if task.get('end_date') else None)
-            submitted=st.form_submit_button('업무 수정 저장')
-        if submitted:
-            try:edit_task_content(task_id,title,description,day.isoformat() if day else '',start.strip(),end.strip(),end_day.isoformat() if end_day else '')
-            except ValueError as error:st.error(str(error))
-            else:st.rerun()
-        st.caption('기한을 지워도 기존 Google 일정은 자동 삭제하지 않습니다. 수정 내용은 재분석으로 덮어쓰지 않습니다.')
+def render_task_editor(task_id=None):
+    live = {t['task_id']: t for t in st.session_state.tasks if not t.get('trashed')}
+    if not live:
+        st.info('수정할 업무가 없습니다.')
+        return
+    if task_id not in live:
+        task_id = st.selectbox('수정할 업무', list(live), format_func=lambda key: live[key]['title'], key='content_edit_pick')
+    task = live[task_id]
+    revision = hashlib.sha256(json.dumps({k:task.get(k, '') for k in ('title','description','deadline','start_time','end_time','end_date')}, sort_keys=True).encode()).hexdigest()[:12]
+    with st.form('content_edit_' + task_id + '_' + revision):
+        title = st.text_input('업무 제목', value=task['title'])
+        description = st.text_area('해야 할 일', value=task.get('description', ''))
+        day = st.date_input('마감 / 시작 날짜 · 미정이면 비움', value=date.fromisoformat(task['deadline']) if task.get('deadline') else None)
+        a, b = st.columns(2)
+        start = a.text_input('시작 시각 · HH:MM', value=task.get('start_time', ''))
+        end = b.text_input('종료 시각 · 선택', value=task.get('end_time', ''))
+        end_day = st.date_input('종료 날짜 · 선택', value=date.fromisoformat(task['end_date']) if task.get('end_date') else None)
+        submitted = st.form_submit_button('수정 저장', type='primary')
+    if submitted:
+        try:
+            edit_task_content(task_id, title, description, day.isoformat() if day else '', start.strip(), end.strip(), end_day.isoformat() if end_day else '')
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            close_ui_dialog()
+            st.rerun()
+    st.caption('날짜를 지워도 기존 Google 일정은 유지됩니다. 수정 내용은 재분석 시에도 보존됩니다.')
+
 
 
 def render_evidence(task):
@@ -1973,7 +1891,7 @@ def render_evidence(task):
 
 def render_mail_panel():
     """메일은 사용자가 요청하면 바로 발송됩니다. 여기서는 발송 결과만 확인합니다."""
-    with st.expander('메일 발송 내역'):
+    with st.container():
         if not st.session_state.mail_history:
             st.caption('아직 발송한 메일이 없습니다. "회의 요약을 메일로 보내줘"처럼 요청하면 바로 발송합니다.')
         if st.session_state.mail_history:
@@ -1988,10 +1906,10 @@ def render_mail_panel():
 
 
 def render_backup_panel():
-    with st.expander('기록 백업 다운로드 · 복원'):
+    with st.container():
         data=json.dumps(build_backup(),ensure_ascii=False,indent=2)
         st.download_button('회의·전체 업무 백업 다운로드',data,file_name='meeting_history.json',mime='application/json',key='full_backup_download')
-        uploaded=st.file_uploader('이전에 다운로드한 JSON 백업',type=['json'],key='backup_upload')
+        uploaded=st.file_uploader('이전에 다운로드한 JSON 백업',type=['json'],max_upload_size=20,key='backup_upload')
         if uploaded is not None and st.button('백업 검증 후 복원'):
             try:
                 raw=uploaded.getvalue()
@@ -2012,7 +1930,7 @@ def render_backup_panel():
 
 
 def render_calendar_diagnostics():
-    with st.expander('Google Calendar 연결 진단 · 다시 확인'):
+    with st.container():
         st.caption('앱 캘린더 표시는 Google 등록 성공과 별개입니다. 아래에서 실제 API 연결과 업무 상태를 확인하세요.')
         if st.button('Google 연결 진단 (읽기만 수행)'):
             try:
@@ -2045,35 +1963,179 @@ def render_calendar_diagnostics():
 
 
 def main():
-    """Streamlit이 실행할 시작점입니다. 함수 정의가 모두 끝난 뒤 호출합니다."""
+    """Reserve the calendar first visually, render audio before network synchronization."""
     global client
-    st.set_page_config(page_title="AIVLE", page_icon="🤖", layout="wide", initial_sidebar_state="expanded")
+    st.set_page_config(page_title='AIVLE · AI 개인비서', page_icon='🤖', layout='wide', initial_sidebar_state='expanded')
     load_local_env()
     client = OpenAI()
     initialize_state()
     initialize_feature_state()
     st.markdown(APP_STYLE, unsafe_allow_html=True)
-    # 음성 플레이어를 가장 먼저 그립니다. 아래 Google 일정 동기화가 오래 걸려도 답변 음성이 바로 재생되고,
-    # 화면 맨 위 고정 위치라 다른 경고가 생겨도 플레이어가 다시 만들어지지 않습니다.
+    # The empty slot precedes audio in the document, without delaying audio for Google API calls.
+    calendar_slot = st.container()
     render_voice()
     checkpoint_current_meeting()
     sync_calendar_tasks()
     checkpoint_current_meeting()
     load_saved_uploads()
-    sync_failures = [t for t in st.session_state.tasks if t.get('sync_status')=='failed' and not t.get('trashed') and not t.get('done')]
-    if sync_failures:
-        st.warning(f"Google Calendar 연동 실패 {len(sync_failures)}건 · 내 업무에서 재시도할 수 있습니다.")
-    render_calendar_diagnostics()
-    render_mail_panel()
-    render_backup_panel()
     with st.sidebar:
         render_sidebar()
-    if st.session_state.page == "내 업무":
+    with calendar_slot:
+        if st.session_state.page == '홈':
+            render_calendar_dashboard()
+        elif st.session_state.page == '내 업무':
+            page_heading('✓', '내 업무', '마감과 진행 상태를 한눈에 확인하세요.')
+        else:
+            page_heading('▤', '회의 요약', '핵심 내용과 배정 업무를 확인하세요.')
+    failures = [t for t in st.session_state.tasks if t.get('sync_status') == 'failed' and not t.get('trashed') and not t.get('done')]
+    if failures:
+        st.warning(f'일정 {len(failures)}개의 Google 연동을 확인해 주세요. 사이드바의 연결 진단에서 자세히 볼 수 있습니다.')
+    if st.session_state.page == '내 업무':
         render_tasks()
-    elif st.session_state.page == "회의 요약":
+    elif st.session_state.page == '회의 요약':
         render_meetings()
     else:
         render_home()
+    panel = st.session_state.get('active_dialog')
+    if panel:
+        open_ui_dialog(panel)
+
+
+
+
+def readable_markdown(text):
+    """Normalize excessive blank lines without modifying stored meeting facts."""
+    return re.sub(r'\n[ \t]*\n(?:[ \t]*\n)+', '\n\n', str(text or '').strip())
+
+
+def close_ui_dialog():
+    st.session_state.pop('active_dialog', None)
+
+
+@st.dialog('AIVLE · 업무 도구', width='large', on_dismiss=close_ui_dialog)
+def open_ui_dialog(panel):
+    if panel == 'calendar':
+        st.subheader('Google Calendar 연결 진단')
+        render_calendar_diagnostics()
+    elif panel == 'mail':
+        st.subheader('메일 발송 내역')
+        render_mail_panel()
+    elif panel == 'backup':
+        st.subheader('기록 백업 · 복원')
+        render_backup_panel()
+    elif panel == 'edit_task':
+        st.subheader('업무 수정')
+        render_task_editor(st.session_state.get('editing_task_id'))
+    elif panel == 'add_task':
+        st.subheader('새 업무 추가')
+        with st.form('add_task_form', clear_on_submit=True):
+            title = st.text_input('업무 이름', placeholder='해야 할 일을 입력하세요')
+            deadline = st.date_input('마감일 · 미정이면 비움', value=None)
+            st.caption('날짜를 지정하면 저장 후 Google Calendar에 자동 연동됩니다.')
+            added = st.form_submit_button('업무 추가', type='primary')
+        if added:
+            if not title.strip():
+                st.warning('업무 이름을 입력하세요.')
+            else:
+                add_manual_task(title.strip(), deadline.isoformat() if deadline else '')
+                close_ui_dialog()
+                st.rerun()
+    if st.button('닫기', key='close_dialog'):
+        close_ui_dialog()
+        st.rerun()
+
+
+def render_meeting_context(location):
+    with st.container(border=True, key='card_context_' + location):
+        st.markdown('**현재 회의 · ' + st.session_state.get('current_meeting_name', '선택한 회의 없음') + '**')
+        current = st.session_state.get('meeting_date')
+        if current:
+            st.caption('회의 기준일 ' + current)
+        with st.expander('회의 변경 · 새 회의록 업로드', expanded=not bool(st.session_state.get('meeting_id'))):
+            render_meeting_picker(location)
+
+
+def render_calendar_dashboard():
+    page_heading('▦', '업무 캘린더', '김 대리님의 일정을 한눈에 확인하세요.')
+    with st.container(border=True, key='calendar_card'):
+        result = calendar(events=st.session_state.calendar_tasks,
+            options={'initialView':'dayGridMonth', 'locale':'ko', 'timeZone':'local',
+                     'displayEventTime':True, 'eventTimeFormat':{'hour':'2-digit','minute':'2-digit','hour12':False},
+                     'height':'auto', 'contentHeight':'auto', 'fixedWeekCount':False,
+                     'dayMaxEvents':3, 'handleWindowResize':True,
+                     'buttonText':{'today':'오늘', 'month':'월', 'week':'주', 'day':'일', 'list':'목록'},
+                     'headerToolbar':{'left':'prev,next today', 'center':'title', 'right':'dayGridMonth,listMonth'}},
+            custom_css=CALENDAR_STYLE, key='work_calendar')
+        if isinstance(result, dict) and result.get('eventClick'):
+            event = result['eventClick'].get('event', {})
+            st.info(str(event.get('title', '선택한 일정')) + ' · ' + str(event.get('start', '')).replace('T', ' ')[:16])
+        st.caption('진행 중이며 날짜가 정해진 업무를 표시합니다. 날짜 미정 업무는 내 업무에서 확인하세요.')
+
+
+def render_task_row(task, trashed=False, prefix=''):
+    key = prefix + task['task_id']
+    with st.container(border=True, key='card_task_' + key):
+        name, deadline, status, action = st.columns([4.5, 2, 1.8, 1.1], gap='small')
+        with name:
+            if trashed:
+                st.markdown('**' + task['title'] + '**')
+            else:
+                checked = st.checkbox(task['title'], value=bool(task.get('done')), key='done_' + key)
+                if checked != bool(task.get('done')):
+                    task['done'] = checked
+                    refresh_app_calendar()
+                    st.rerun()
+            st.caption(task.get('meeting_name') or '직접 추가')
+        with deadline:
+            day = task.get('deadline', '')
+            st.markdown('**' + ((day[5:].replace('-', '/') + ' ' + task.get('start_time', '')).strip() if day else '날짜 미정') + '**')
+            st.caption(dday_label(day) if day else '날짜를 지정해 주세요')
+        with status:
+            label = '연동 보류' if task.get('sync_paused') else {'synced':'연동 완료','failed':'연동 실패','restored':'연동 보류'}.get(task.get('sync_status'), '미등록')
+            st.caption('Google Calendar')
+            st.write(label)
+        with action:
+            if trashed:
+                if st.button('복원', key='restore_' + key):
+                    set_task_trashed(task['task_id'], False)
+                    st.rerun()
+            elif st.button('수정' if day else '날짜 지정', key='edit_' + key, use_container_width=True):
+                st.session_state.editing_task_id = task['task_id']
+                st.session_state.active_dialog = 'edit_task'
+        if task.get('date_error'): st.warning(task['date_error'])
+        if task.get('sync_error'): st.warning(task['sync_error'])
+        with st.expander('상세 · 원문 근거', expanded=False):
+            if task.get('description'): st.write(task['description'])
+            if task.get('due_text'): st.caption('기한 원문: ' + task['due_text'])
+            if task.get('date_resolution'): st.caption('날짜 해석: ' + task['date_resolution'] + ' · 기준일 ' + task.get('deadline_base', ''))
+            if task.get('source') == 'manual':
+                st.caption('직접 추가한 업무입니다.')
+            elif task.get('evidence_verified'):
+                st.caption('원문 대조 완료')
+                st.write(task.get('evidence', ''))
+            else:
+                st.warning('원문 근거 확인이 필요합니다. 회의 원문을 확인하거나 다시 분석하세요.')
+            if task.get('google_event_url'):
+                st.link_button('Google 일정 보기 ↗', task['google_event_url'])
+            if not trashed and st.button('휴지통으로 이동', key='trash_' + key):
+                set_task_trashed(task['task_id'], True)
+                st.rerun()
+
+
+CALENDAR_STYLE = """
+.fc { font-family: 'Pretendard', 'Noto Sans KR', 'Malgun Gothic', sans-serif; color:#25354a; }
+.fc .fc-toolbar-title { font-size:1.6rem; font-weight:750; }
+.fc .fc-button-primary { background:#087f69; border-color:#087f69; box-shadow:none; }
+.fc .fc-button-primary:hover, .fc .fc-button-primary:not(:disabled).fc-button-active { background:#066451; border-color:#066451; }
+.fc .fc-daygrid-day-frame { min-height:78px; }
+.fc .fc-day-today { background:#edf8f4 !important; }
+.fc .fc-col-header-cell { background:#f6f8fa; padding:9px 0; }
+.fc .fc-daygrid-day-number { padding:8px 10px; font-size:14px; }
+.fc .fc-event { border-radius:5px; font-size:13px; }
+.fc .fc-daygrid-event { white-space:normal; }
+.fc .fc-scrollgrid, .fc td, .fc th { border-color:#e4e9ef; }
+@media(max-width:700px) { .fc .fc-toolbar { flex-wrap:wrap; gap:10px; } .fc .fc-toolbar-title { font-size:1.2rem; } }
+"""
 
 
 if __name__ == "__main__":
