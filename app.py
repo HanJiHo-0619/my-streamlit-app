@@ -6,6 +6,7 @@
 # ========================================================================
 
 import asyncio
+import copy
 import hashlib
 import uuid
 import base64
@@ -29,7 +30,9 @@ from streamlit_calendar import calendar
 MODEL = "gpt-6-luna"
 SCOPES = ["https://www.googleapis.com/auth/calendar.events"]
 KST = timezone(timedelta(hours=9))
-MAX_TURNS = 10
+MAX_TURNS = 10  # 회의별 최근 대화 10회 왕복
+MAX_MEETING_HISTORY = 10  # 최근 회의 기록 수 (원문·분석·업무·대화)
+GOOGLE_CALENDAR_URL = "https://calendar.google.com/calendar/"
 
 
 # 자주 바꾸는 GitHub 배포 설정은 여기에서만 수정합니다.
@@ -348,6 +351,11 @@ def initialize_state():
         st.session_state.analyzed_meeting_id = ""
     if "uploads" not in st.session_state:
         st.session_state.uploads = []
+    for item in st.session_state.uploads:
+        item.setdefault('meeting_id',hashlib.sha256(item['text'].encode('utf-8')).hexdigest())
+        item.setdefault('snapshot',{})
+    st.session_state.uploads = st.session_state.uploads[:MAX_MEETING_HISTORY]
+
 
 
 # 현재 업로드 원문을 반환합니다. 없으면 기존 meeting.txt를 확인합니다.
@@ -406,12 +414,19 @@ def seed_app_calendar():
 
 # 업로드는 현재 접속 세션에 보관하고 공통 회의 선택 함수를 호출합니다.
 def remember_upload(name, text):
-    """원문을 현재 접속 세션에 보관합니다. 같은 파일명도 내용 변경을 인식합니다."""
-    identity = hashlib.sha256((name + '\0' + text).encode('utf-8')).hexdigest()
-    if not any(u['path'] == identity for u in st.session_state.uploads):
-        st.session_state.uploads.insert(0, {'name': name, 'path': identity, 'text': text,
-            'saved_at': datetime.now(KST).strftime('%Y.%m.%d %H:%M')})
+    """같은 내용은 한 회의로 관리하며, 최근 업로드한 회의 MAX_MEETING_HISTORY개만 보관합니다."""
+    checkpoint_current_meeting()
+    identity = hashlib.sha256(text.encode('utf-8')).hexdigest()
+    item = next((u for u in st.session_state.uploads if u.get('meeting_id',u.get('path'))==identity), None)
+    if item is None:
+        item={'name':name,'path':identity,'meeting_id':identity,'text':text,'snapshot':{}}
+    item.update(name=name, saved_at=datetime.now(KST).strftime('%Y.%m.%d %H:%M'))
+    st.session_state.uploads = [item] + [u for u in st.session_state.uploads if u is not item and u.get('meeting_id',u.get('path'))!=identity]
+    # 이동 전에 이전 회의의 마지막 결과를 저장한 뒤 새 회의를 복원합니다.
     select_meeting(text)
+    st.session_state.current_meeting_name = name
+    st.session_state.uploads = st.session_state.uploads[:MAX_MEETING_HISTORY]
+
 
 
 
@@ -468,21 +483,31 @@ def sorted_tasks(tasks):
 
 
 def select_meeting(text):
-    """회의 내용이 달라지면 분석/대화만 초기화하고 수동 업무는 보존합니다."""
+    """회의 변경 전 결과를 보관하고, 이전에 선택한 회의는 분석/업무/대화를 복원합니다."""
     identity = hashlib.sha256(text.encode('utf-8')).hexdigest()
     if identity == st.session_state.get('meeting_id'):
         return False
+    checkpoint_current_meeting()
+    item = next((u for u in st.session_state.uploads if u.get('meeting_id',u.get('path'))==identity), None)
+    snapshot = item.get('snapshot',{}) if item else {}
+    manual = [t for t in st.session_state.tasks if t.get('source')=='manual']
     st.session_state.meeting_id = identity
     st.session_state.meeting_text = text
-    st.session_state.summary = ''
-    st.session_state.events = []  # 분석 원본 보관용. 업무 수정의 기준은 tasks입니다.
-    st.session_state.analyzed_meeting_id = ''
-    st.session_state.messages = []
-    st.session_state.tasks = [t for t in st.session_state.tasks if t.get('source') == 'manual']
-    for key in ['autoplay_voice', 'voice_error']:
-        st.session_state.pop(key, None)
+    st.session_state.current_meeting_name = item['name'] if item else '선택한 회의록'
+    st.session_state.summary = snapshot.get('summary','')
+    st.session_state.events = copy.deepcopy(snapshot.get('events',[]))
+    st.session_state.tasks = manual + copy.deepcopy(snapshot.get('tasks',[]))
+    st.session_state.messages = copy.deepcopy(snapshot.get('messages',[]))[-MAX_TURNS*2:]
+    st.session_state.analyzed_meeting_id = snapshot.get('analyzed_meeting_id','')
+    for key in ['autoplay_voice','voice_error']:
+        st.session_state.pop(key,None)
+    # 같은 업무를 다른 회의에서 보던 위젯의 완료 상태가 복원 결과를 덮지 않게 합니다.
+    for key in list(st.session_state):
+        if key.startswith('done_'):
+            del st.session_state[key]
     refresh_app_calendar()
     return True
+
 
 
 def refresh_app_calendar():
@@ -524,6 +549,21 @@ def add_manual_task(title, deadline=''):
         'description':'','due_text':'','deadline':deadline,'end_date':'','start_time':'','end_time':'',
         'done':False,'event_id':'','sync_status':'local'})
     refresh_app_calendar()
+
+
+def checkpoint_current_meeting():
+    """현재 결과를 최근 회의 항목에 저장합니다. 음성 바이트/인증정보는 저장하지 않습니다."""
+    identity = st.session_state.get('meeting_id','')
+    item = next((u for u in st.session_state.uploads if u.get('meeting_id',u.get('path')) == identity), None)
+    if item is None:
+        return
+    item['snapshot'] = {
+        'summary':st.session_state.summary,
+        'events':copy.deepcopy(st.session_state.events),
+        'tasks':copy.deepcopy([t for t in st.session_state.tasks if t.get('source')=='meeting']),
+        'messages':[{'role':m['role'],'content':m['content']} for m in st.session_state.messages[-MAX_TURNS*2:]],
+        'analyzed_meeting_id':st.session_state.get('analyzed_meeting_id',''),
+    }
 
 
 # ========================================================================
@@ -1080,9 +1120,11 @@ def render_sidebar():
     else:
         st.caption(f"메일 설정 필요: Secrets의 {MAIL_PASSWORD_SECRET}")
     if (os.getenv("GOOGLE_TOKEN") or "").strip() or os.path.exists("token.json"):
-        st.markdown('<div class="connection">▣ &nbsp; 캘린더 <em>연결됨</em></div>', unsafe_allow_html=True)
+        st.markdown('<div class="connection">▣ &nbsp; 캘린더 <em>인증 설정됨</em></div>', unsafe_allow_html=True)
     else:
         st.markdown('<div class="connection">▣ &nbsp; 캘린더 <em>연결 필요</em></div>', unsafe_allow_html=True)
+    st.link_button('Google Calendar 열기', GOOGLE_CALENDAR_URL, use_container_width=True)
+    st.caption('웹 캘린더를 엽니다. 브라우저 계정과 앱의 Google 인증 계정이 같은지 확인하세요.')
     st.markdown("</div>", unsafe_allow_html=True)
 
 
@@ -1096,6 +1138,9 @@ def page_heading(icon, title, description):
 
 
 def render_home():
+    # 홈에서도 회의 요약 화면과 같은 업로드·기록 선택 기능을 제공합니다.
+    with st.container(border=True):
+        render_meeting_picker('home')
     main, chat = st.columns([3.05, 1.25], gap="large")
     with main:
         st.markdown('<div class="home-hero">AIVLE과 함께<br>업무를 <strong>더 효율적으로</strong> 관리하세요.</div>', unsafe_allow_html=True)
@@ -1241,27 +1286,7 @@ def render_meetings():
     left, right = st.columns([1, 1.65], gap="large")
     with left:
         with st.container(border=True):
-            st.markdown("<div class='upload-intro'>☁<br><b>회의 텍스트 파일 업로드</b><small>.txt 파일 (최대 50MB)</small></div>", unsafe_allow_html=True)
-            uploaded = st.file_uploader("파일 선택", type=["txt"], label_visibility="collapsed")
-            if uploaded is not None:
-                content_id = uploaded.name + hashlib.sha256(uploaded.getvalue()).hexdigest()
-                if st.session_state.get('last_upload_id') != content_id:
-                    try:
-                        text = uploaded.getvalue().decode('utf-8-sig')
-                    except UnicodeDecodeError:
-                        st.error('UTF-8 형식의 txt 파일을 업로드하세요.')
-                    else:
-                        remember_upload(uploaded.name, text)
-                        st.session_state.last_upload_id = content_id
-                        st.rerun()
-            st.divider()
-            st.markdown("<h3 class='recent-title'>◷ &nbsp;최근 업로드</h3>", unsafe_allow_html=True)
-            if not st.session_state.uploads:
-                st.markdown('<p class="empty-text">올린 회의록이 없습니다.</p>', unsafe_allow_html=True)
-            for item in st.session_state.uploads[:8]:
-                if st.button(f"▤   {item['name']}\n{item['saved_at']}", key=f"upload_{item['path']}", use_container_width=True):
-                    select_meeting(item['text'])
-                    st.rerun()
+            render_meeting_picker('meetings')
     with right:
         with st.container(border=True):
             if st.session_state.summary:
@@ -1281,6 +1306,48 @@ def render_meetings():
             render_chat("회의 내용에 대해 추가 질문하세요...")
 
 
+def render_meeting_picker(location):
+    """홈/회의 화면이 같은 업로드·기록 복원 코드를 사용합니다."""
+    st.markdown('**회의록 업로드 · 최근 회의**')
+    uploaded = st.file_uploader('UTF-8 회의록 (.txt, 최대 50MB)',type=['txt'],key='meeting_file_'+location)
+    if uploaded is not None:
+        raw = uploaded.getvalue()
+        signature = uploaded.name + hashlib.sha256(raw).hexdigest()
+        widget_key = 'processed_upload_'+location
+        if st.session_state.get(widget_key) != signature:
+            if len(raw)>50*1024*1024:
+                st.error('50MB 이하의 파일을 선택하세요.')
+            else:
+                try:
+                    text = raw.decode('utf-8-sig')
+                except UnicodeDecodeError:
+                    st.error('UTF-8 형식으로 저장한 txt 파일을 업로드하세요.')
+                else:
+                    if not text.strip():
+                        st.error('내용이 비어 있는 회의록입니다.')
+                    else:
+                        remember_upload(uploaded.name,text)
+                        st.session_state[widget_key]=signature
+                        st.rerun()
+    if st.session_state.get('meeting_id'):
+        st.caption('현재 회의: '+st.session_state.get('current_meeting_name','선택한 회의록'))
+    with st.expander(f'최근 회의 ({len(st.session_state.uploads)}/{MAX_MEETING_HISTORY})',expanded=location=='meetings'):
+        st.caption('현재 접속 세션에서 원문·분석·업무·최근 대화를 보관합니다. 새 접속/서버 재시작 후에는 초기화될 수 있습니다.')
+        for item in st.session_state.uploads[:MAX_MEETING_HISTORY]:
+            badge = ' · 현재' if item.get('meeting_id',item['path'])==st.session_state.get('meeting_id') else ''
+            if st.button(item['name']+' · '+item['saved_at']+badge,key=location+'_history_'+item['path'],use_container_width=True):
+                select_meeting(item['text'])
+                st.rerun()
+        if not st.session_state.uploads:
+            st.caption('업로드한 회의록이 없습니다.')
+        else:
+            checkpoint_current_meeting()
+            # 다운로드한 기록에는 API 키·토큰·음성 바이트를 포함하지 않습니다.
+            archive = {'version':1,'meetings':st.session_state.uploads[:MAX_MEETING_HISTORY]}
+            st.download_button('회의 내역 보관용 다운로드',json.dumps(archive,ensure_ascii=False,indent=2),
+                file_name='meeting_history.json',mime='application/json',key='history_export_'+location)
+
+
 def main():
     """Streamlit이 실행할 시작점입니다. 함수 정의가 모두 끝난 뒤 호출합니다."""
     global client
@@ -1288,6 +1355,7 @@ def main():
     load_local_env()
     client = OpenAI()
     initialize_state()
+    checkpoint_current_meeting()
     refresh_app_calendar()
     st.markdown(APP_STYLE, unsafe_allow_html=True)
     load_saved_uploads()
