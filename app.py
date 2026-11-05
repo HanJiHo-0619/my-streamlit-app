@@ -30,10 +30,6 @@ from openai import OpenAI
 from streamlit_calendar import calendar
 
 
-# 자주 바꾸는 GitHub 배포 설정은 여기에서만 수정합니다.
-# GH_TOKEN은 Colab Secrets에 보관하며 코드에 직접 입력하지 않습니다.
-GH_USER = "HanJiHo-0619"
-REPO = "my-streamlit-app"
 
 # 메일 수신 주소: 여기서 변경합니다. 요청에서 지정한 주소가 있으면 그 주소가 우선입니다.
 DEFAULT_RECIPIENT = "giho9890@naver.com"
@@ -1342,7 +1338,19 @@ def _tts_pcm(text):
     )
     content = response.candidates[0].content if response.candidates else None
     parts = content.parts if content and content.parts else []
-    return b"".join(p.inline_data.data for p in parts if p.inline_data and p.inline_data.data)
+    return b"".join(audio_to_pcm(p.inline_data.data) for p in parts if p.inline_data and p.inline_data.data)
+
+
+def audio_to_pcm(data):
+    """TTS 응답에서 소리(PCM)만 꺼냅니다.
+    gemini-3.8-flash-tts는 원시 PCM이 아니라 WAV 파일 전체(앞 헤더 + 뒤쪽 C2PA 출처 정보)를 돌려줍니다.
+    이를 그대로 다시 WAV로 감싸면 헤더와 출처 정보까지 소리로 재생돼 끝에 약 0.1초 '터지는' 잡음이 납니다."""
+    if data[:4] != b"RIFF":
+        return data  # 원시 PCM(24kHz·16bit·mono)이면 그대로 사용
+    with wave.open(io.BytesIO(data)) as wf:
+        if (wf.getframerate(), wf.getsampwidth(), wf.getnchannels()) != (24000, 2, 1):
+            raise RuntimeError("지원하지 않는 음성 형식입니다.")  # 예비 Live 경로로 넘어갑니다.
+        return wf.readframes(wf.getnframes())
 
 
 def synthesize_speech(text):
@@ -1372,31 +1380,26 @@ def voice_script(text):
 
 # 저장된 음성을 브라우저에서 재생합니다. 중복 재생 방지용 상태를 사용합니다.
 def render_voice():
-    """A stable compact player; history controls do not interrupt autoplay."""
-    vault = st.session_state.audio_vault
-    if not vault:
-        return
-    active = st.session_state.get('active_audio_id')
-    if active not in vault:
-        active = next(reversed(vault))
-        st.session_state.active_audio_id = active
-    with st.container(border=True, key='voice_player'):
-        st.caption('답변 음성 · ' + speech_text(vault[active]['label']).replace('\n', ' ')[:64])
-        st.audio(vault[active]['data'], format='audio/wav',
-                 autoplay=st.session_state.get('autoplay_audio_id', '') == active)
-        with st.expander('이전 음성 · 다운로드'):
-            options = list(reversed(vault))
-            chosen = st.selectbox('다시 들을 답변', options, index=options.index(active),
-                format_func=lambda key: vault[key]['created_at'][11:19] + ' · ' + speech_text(vault[key]['label']).replace('\n', ' ')[:55],
-                key='audio_pick_' + active)
-            if chosen != active:
-                st.session_state.active_audio_id = chosen
-                st.session_state.autoplay_audio_id = chosen
-                st.rerun()
-            st.download_button('음성 다운로드', vault[active]['data'], file_name='answer.wav',
-                               mime='audio/wav', key='audio_download_' + active)
-            st.caption(f'최근 {MAX_AUDIO_ITEMS}개 · 총 {MAX_AUDIO_BYTES // 1024 // 1024}MB까지 현재 세션에 보관합니다.')
-
+    """기본 플레이어 하나로 자동 재생·일시정지·재개·탐색을 제공합니다."""
+    vault=st.session_state.audio_vault
+    if not vault:return
+    active=st.session_state.get('active_audio_id')
+    if active not in vault:active=next(reversed(vault))
+    options=list(reversed(vault))
+    with st.container(border=True):
+        st.caption(f'답변 음성 · 최근 {MAX_AUDIO_ITEMS}개 / 총 {MAX_AUDIO_BYTES//1024//1024}MB 이내 · 현재 세션 보관')
+        chosen=st.selectbox('다시 들을 답변',options,index=options.index(active),
+            format_func=lambda key:vault[key]['created_at'][11:19]+' · '+vault[key]['label'],key='audio_pick_'+active)
+        if chosen!=active:
+            st.session_state.active_audio_id=chosen
+            st.session_state.autoplay_audio_id=chosen
+            st.rerun()
+        # 자동 재생 표시를 지우지 않고 유지합니다. 화면이 다시 그려져도 플레이어 설정이 그대로라 멈추지 않고,
+        # Streamlit은 같은 플레이어를 한 번만 자동 재생하므로 다시 처음부터 재생되지도 않습니다.
+        autoplay=st.session_state.get('autoplay_audio_id','')==active
+        st.audio(vault[active]['data'],format='audio/wav',autoplay=autoplay)
+        st.caption('플레이어에서 일시정지/계속 재생이 가능합니다. 재생 막대를 맨 앞으로 옮기면 처음부터 들을 수 있습니다.')
+        st.download_button('이 음성 다운로드',vault[active]['data'],file_name='answer.wav',mime='audio/wav',key='audio_download_'+active)
 
 
 
