@@ -6,9 +6,13 @@
 - 화면 디자인은 팀 UI 시안(유령 캐릭터·카드형 사이드바·주제 카드)을 바탕으로 했다.
 - 답변 방식·추천 질문·화면 문구는 aivle_config.py(사람이 정하는 설정)에서 가져온다.
 - 아이콘은 Streamlit 기본 Material 아이콘, 로고·캐릭터는 assets/ 폴더의 이미지 파일을 쓴다.
+- 앱 폴더에 기본 백서(data/)가 있으면 업로드 없이 바로 시작할 수 있다. 없으면 업로드만 쓴다.
+- 대화 첫 질문의 답변은 서버 메모리에 저장해 같은 질문에 바로 답한다 (같은 문서 · 같은 설정일 때만).
 - API 키 등 비밀 값은 Streamlit Secrets에서만 읽는다.
 """
 import base64
+import collections
+import copy
 import functools
 import hashlib
 import html
@@ -53,6 +57,7 @@ EMBED_CACHE = os.getenv('EMBED_CACHE_DIR') or os.path.join(tempfile.gettempdir()
 MAX_MB = cfg.MAX_UPLOAD_MB
 AVATAR = ':material/chat:'
 ASSET_DIR = os.path.join(APP_DIR, 'assets')
+DEFAULT_PDF = os.path.join(APP_DIR, cfg.DEFAULT_PDF_PATH) if cfg.DEFAULT_PDF_PATH else None
 TOPICS, READY_QUESTIONS, CHAT_CHIPS = cfg.TOPICS, cfg.READY_QUESTIONS, cfg.CHAT_CHIPS
 TOPIC_ICON = {key: icon for key, icon, _title, _questions in TOPICS}
 INTENT_LABEL = {'fact': '공식·사실', 'experience': '선배 경험', 'advice': '조언',
@@ -104,6 +109,13 @@ CSS = '''
 [data-testid="stMainBlockContainer"]{max-width:1280px!important;padding:2.6rem 2rem 140px!important;}
 p,label,button,li{font-family:Inter,"Pretendard","Noto Sans KR","Apple SD Gothic Neo","Malgun Gothic",sans-serif;}
 .mi{font-family:"Material Symbols Rounded";font-weight:400;font-style:normal;line-height:1;letter-spacing:normal;text-transform:none;display:inline-block;white-space:nowrap;font-feature-settings:"liga";-webkit-font-smoothing:antialiased;flex-shrink:0;}
+.or-line{display:flex;align-items:center;gap:8px;color:#8aa0aa;font-size:12px;margin:2px 0 -4px;}
+.or-line::before,.or-line::after{content:"";flex:1;height:1px;background:#e1eaee;}
+[data-testid="stChatMessage"] [data-testid="stCode"] pre{background:#f4fbfa!important;border:1px solid #cfe6e3;border-radius:12px;}
+[data-testid="stChatMessage"] [data-testid="stCode"] code,[data-testid="stChatMessage"] [data-testid="stCode"] code *{font-family:Inter,"Pretendard","Noto Sans KR","Apple SD Gothic Neo","Malgun Gothic",sans-serif!important;font-size:14px;line-height:1.7;color:#1d3540;letter-spacing:0;}
+.st-key-use_default button{background:#079e9b!important;border-color:#079e9b!important;color:#fff!important;font-weight:700;}
+.st-key-use_default button:hover{background:#06827f!important;border-color:#06827f!important;}
+.st-key-use_default button *{color:#fff!important;}
 .brand-text{font-weight:800;letter-spacing:.06em;color:var(--teal);font-size:30px;}
 .sidebar-logo .brand-text{color:#fff;font-size:34px;}
 /* 사이드바: 카드형 패널 */
@@ -250,8 +262,21 @@ def load_settings():
     return bool(os.getenv('OPENAI_API_KEY'))
 
 
+@st.cache_resource
+def shared():
+    """서버 전체가 같이 쓰는 메모리: 기본 백서 색인과 첫 질문 답변. 앱을 다시 시작하면 비워진다."""
+    return {'lock': threading.Lock(), 'build_lock': threading.Lock(), 'default': None,
+            'default_dir': tempfile.mkdtemp(prefix='aivle-default-'),
+            'answers': collections.OrderedDict(), 'hits': 0}
+
+
+def default_pdf_available():
+    return bool(DEFAULT_PDF) and os.path.isfile(DEFAULT_PDF)
+
+
 def init_state():
     defaults = {'messages': [], 'index': None, 'doc_id': None, 'doc_name': None, 'doc_size': 0, 'chains': {},
+                'doc_source': None, 'pdf_data': None,
                 'uploader_key': 0, 'pending': None, 'admin': False, 'last_trace': None,
                 'last_error': None, 'neo4j_search': False}
     for key, value in defaults.items():
@@ -262,27 +287,19 @@ def init_state():
 
 def reset_document():
     st.session_state.update(index=None, doc_id=None, doc_name=None, doc_size=0, chains={}, messages=[],
-                            last_trace=None)
+                            last_trace=None, doc_source=None, pdf_data=None)
 
 
-def prepare_document(uploaded):
-    """업로드 즉시 색인을 만든다. 같은 파일이면 다시 만들지 않는다."""
-    data = uploaded.getvalue()
-    doc_id = hashlib.sha256(data).hexdigest()[:16]
-    if st.session_state.doc_id == doc_id:
-        return
-    if len(data) > MAX_MB * 1024 * 1024:
-        st.error(f'{MAX_MB}MB 이하의 PDF만 올릴 수 있어요.')
-        return
-    workspace = st.session_state.workspace.name
+def build_document(data, persist_directory):
+    """PDF 바이트로 색인을 만든다 (임시 파일 경로를 넘기고 끝나면 지운다)."""
     with st.status('문서를 준비하고 있어요…', expanded=True) as status:
         try:
-            with tempfile.NamedTemporaryFile(suffix='.pdf', dir=workspace, delete=False) as tmp:
+            with tempfile.NamedTemporaryFile(suffix='.pdf', dir=st.session_state.workspace.name, delete=False) as tmp:
                 tmp.write(data)
                 pdf_path = tmp.name
             try:
                 index = rag_core.build_index(
-                    pdf_path, persist_directory=os.path.join(workspace, 'chroma_db'), cache_dir=EMBED_CACHE,
+                    pdf_path, persist_directory=persist_directory, cache_dir=EMBED_CACHE,
                     graph_path=GRAPH_PATH if os.path.exists(GRAPH_PATH) else None, use_neo4j=True,
                     neo4j_search=st.session_state.neo4j_search, progress=status.write)
             finally:
@@ -290,15 +307,46 @@ def prepare_document(uploaded):
         except Exception as exc:
             logger.exception('문서 준비 실패')         # 원인은 Manage app → 로그에서 확인
             st.session_state.last_error = f'문서 준비: {type(exc).__name__}: {str(exc)[:200]}'
-            reset_document()
             status.update(label='문서를 준비하지 못했어요', state='error')
             st.error('PDF에서 글자를 읽을 수 있는지, API 설정이 맞는지 확인해 주세요.')
-            return
+            return None
         status.update(label=f"준비 완료 · {index.timing['total']:.0f}초", state='complete', expanded=False)
-    index.source = uploaded.name
-    st.session_state.update(index=index, doc_id=doc_id, doc_name=uploaded.name, doc_size=len(data),
-                            chains={}, messages=[], last_trace=None)
-    st.toast(f"문서 준비 완료 · {index.timing['total']:.0f}초")
+    return index
+
+
+def load_document(data, name, source):
+    """업로드한 PDF(source='upload') 또는 기본 백서(source='default')를 준비한다. 같은 파일이면 다시 만들지 않는다.
+    기본 백서와 같은 파일의 색인은 서버에서 한 번만 만들어 모든 세션이 같이 쓴다."""
+    doc_id = hashlib.sha256(data).hexdigest()[:16]
+    if st.session_state.doc_id == doc_id:
+        return
+    if len(data) > MAX_MB * 1024 * 1024:
+        st.error(f'{MAX_MB}MB 이하의 PDF만 올릴 수 있어요.')
+        return
+    store = shared()
+    cached = store['default']
+    index = cached['index'] if cached and cached['doc_id'] == doc_id else None
+    reused = index is not None
+    if index is None and source == 'default':
+        with store['build_lock']:                     # 여러 사람이 동시에 눌러도 한 번만 만든다
+            cached = store['default']
+            index = cached['index'] if cached and cached['doc_id'] == doc_id else None
+            if index is None:
+                index = build_document(data, os.path.join(store['default_dir'], doc_id))
+                if index is not None:
+                    index.source = name
+                    store['default'] = {'doc_id': doc_id, 'index': index}
+    elif index is None:
+        index = build_document(data, os.path.join(st.session_state.workspace.name, 'chroma_db'))
+        if index is not None:
+            index.source = name
+    if index is None:
+        reset_document()
+        return
+    st.session_state.update(index=index, doc_id=doc_id, doc_name=name, doc_size=len(data), doc_source=source,
+                            pdf_data=data, chains={}, messages=[], last_trace=None)
+    st.toast('문서 준비 완료 · 서버에 준비된 색인을 바로 사용해요' if reused else
+             f"문서 준비 완료 · {index.timing['total']:.0f}초")
     st.rerun()                                         # 사이드바를 '준비 완료' 상태로 다시 그린다
 
 
@@ -454,7 +502,83 @@ def page_label(s):
     return f"p.{s['page_start']}" + (f"-{s['page_end']}" if s['page_end'] != s['page_start'] else '')
 
 
-def render_sources(meta, show_sources):
+def chunk_text(chunk_id):
+    """출처 카드에는 앞부분만 있으니, 형광펜용 전체 본문은 색인에서 찾는다."""
+    index = st.session_state.index
+    if getattr(index, '_chunk_text', None) is None:
+        index._chunk_text = {d.metadata['chunk_id']: d.page_content for d in index.docs}
+    return index._chunk_text.get(chunk_id, '')
+
+
+def squash(text):
+    return re.sub(r'\s+', '', text)
+
+
+def highlight_target(text):
+    """형광펜 기준 글자: 맨 앞 [PART > 장 > 절] 경로 줄은 청크 제목(마지막 칸)만 남기고, 표는 칸을 이어 붙인다."""
+    lines = str(text or '').splitlines()
+    if lines and lines[0].startswith('[') and lines[0].endswith(']'):
+        lines[0] = lines[0][1:-1].split(' > ')[-1]
+    return squash(clean_snippet('\n'.join(lines), 100000).replace(' · ', ''))
+
+
+def mark_lines(page, target):
+    """페이지의 줄 중 청크 본문에 들어 있는 줄의 위치 (6글자 이상만, 짧은 줄은 우연히 겹치기 쉬움)."""
+    rects = []
+    for block in page.get_text('dict')['blocks']:
+        for line in block.get('lines', []):
+            key = squash(''.join(span['text'] for span in line['spans']))
+            if len(key) >= 6 and key in target:
+                rects.append(line['bbox'])
+    return rects
+
+
+@st.cache_data(max_entries=64, show_spinner=False)
+def render_pages(doc_id, chunk_id, first, last, text, _pdf, limit=2):
+    """절 범위(first~last쪽)에서 청크 본문이 실제로 있는 쪽을 찾아 그린다 (최대 두 쪽, 원본 파일은 바꾸지 않음).
+    표가 나뉜 청크처럼 절의 시작 쪽과 실제 쪽이 다를 수 있어 쪽마다 확인한다."""
+    import pymupdf
+    target = highlight_target(text)
+    out = []
+    with pymupdf.open(stream=_pdf, filetype='pdf') as pdf:
+        first, last = max(1, first), min(pdf.page_count, last, first + 7)
+        hits = [(n, mark_lines(pdf[n - 1], target)) for n in range(first, last + 1)]
+        chosen = [(n, r) for n, r in hits if r][:limit] or hits[:1]
+        for page_no, rects in chosen:
+            page = pdf[page_no - 1]
+            for rect in rects:
+                annot = page.add_highlight_annot(pymupdf.Rect(rect))
+                annot.set_colors(stroke=(1.0, 0.86, 0.3))
+                annot.update()
+            clip = page.rect
+            if rects:                                   # 참고한 부분 위아래만 잘라 바로 보이게 한다
+                top = min(r[1] for r in rects) - 60
+                bottom = max(r[3] for r in rects) + 60
+                clip = pymupdf.Rect(page.rect.x0, max(page.rect.y0, top), page.rect.x1, min(page.rect.y1, bottom))
+            pix = page.get_pixmap(matrix=pymupdf.Matrix(1.8, 1.8), clip=clip, annots=True)
+            out.append((page_no, pix.tobytes('png'), len(rects)))
+    return out
+
+
+@st.dialog('백서 원문 보기', width='large')
+def show_page(source):
+    data = st.session_state.pdf_data
+    if not data:
+        st.info('원문을 보려면 문서를 다시 준비해 주세요.')
+        return
+    st.html(f'<div class="src-head"><span class="src-page">{page_label(source)}</span>'
+            f'<span class="src-title">{esc(source.get("title"))}</span></div>'
+            f'<div class="src-path">{esc(source.get("section_path"))}</div>')
+    text = chunk_text(source['chunk_id']) or source.get('text', '')
+    pages = render_pages(st.session_state.doc_id, source['chunk_id'], source['page_start'], source['page_end'],
+                         text, data)
+    for page_no, png, _found in pages:
+        st.image(png, caption=f'p.{page_no}', width='stretch')
+    st.caption('노란 형광펜: 답변이 참고한 부분이에요 (그 부분 위아래만 잘라 보여 드려요).' if any(f for _n, _p, f in pages) else
+               '참고한 부분을 페이지에서 정확히 찾지 못했어요. 위 쪽 안에서 확인해 주세요.')
+
+
+def render_sources(meta, show_sources, message_id):
     numbered = meta.get('numbered') or []
     if not show_sources or not numbered:
         return
@@ -470,6 +594,9 @@ def render_sources(meta, show_sources):
                 <span class="src-title">{esc(s.get("title"))}</span></div>
                 <div class="src-path">{esc(s.get("section_path"))}</div>
                 <div class="src-text">{esc(clean_snippet(s.get("text")))}</div></div>''')
+            if st.session_state.pdf_data and st.button('원문 보기', key=f"page_{message_id}_{s['number']}",
+                                                       icon=':material/find_in_page:'):
+                show_page(s)
 
 
 def render_steps(steps):
@@ -498,9 +625,53 @@ def save_feedback(message_id):
             m['feedback'] = {0: 'down', 1: 'up'}.get(value)
 
 
+def make_inquiry(question, answer):
+    """백서로 확인하지 못한 내용을 담당 매니저에게 물어볼 메시지 초안 (LLM 1회, 버튼을 눌렀을 때만)."""
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.prompts import ChatPromptTemplate
+    prompt = ChatPromptTemplate.from_messages([('system', cfg.INQUIRY_SYSTEM), ('human', cfg.INQUIRY_TEMPLATE)])
+    return (prompt | rag_core.make_llm() | StrOutputParser()).invoke({'question': question, 'answer': answer}).strip()
+
+
+def render_inquiry(message):
+    meta = message.get('meta') or {}
+    if not (meta.get('unverified') or meta.get('intent') == 'out_of_scope'):
+        return
+    if message.get('inquiry'):
+        st.html(f'<div class="followup-title">{mi("edit_note", 17)}<span>매니저에게 보낼 문의 초안 · 오른쪽 위 버튼으로 복사</span></div>')
+        st.code(message['inquiry'], language=None, wrap_lines=True)
+        return
+    if st.button('매니저에게 물어볼 문장 만들기', key=f"inq_{message['id']}", icon=':material/edit_note:'):
+        try:
+            with st.spinner('문의 문장을 쓰고 있어요…'):
+                message['inquiry'] = make_inquiry(meta.get('question', ''), message['content'])
+        except Exception as exc:
+            logger.exception('문의 초안 실패')
+            st.session_state.last_error = f'문의 초안: {type(exc).__name__}: {str(exc)[:200]}'
+            st.error('문의 문장을 만들지 못했어요. 잠시 후 다시 눌러 주세요.')
+            return
+        st.rerun()
+
+
+def concept_buttons(message, concept_map):
+    """개념 지도의 개념을 누르면 바로 물어본다 (질문에 없던 이웃 개념 먼저, 최대 6개)."""
+    question = (message.get('meta') or {}).get('question', '')
+    nodes = sorted(concept_map['nodes'], key=lambda n: n['query'])
+    names = [n['name'] for n in nodes if n['name'] not in question][:6]
+    if not names:
+        return
+    st.html('<div class="map-legend">개념을 누르면 바로 물어봐요</div>')
+    cols = st.columns(3, gap='small')
+    for i, name in enumerate(names):
+        if cols[i % 3].button(name, key=f"cm_{message['id']}_{i}", icon=':material/hub:', width='stretch'):
+            st.session_state.pending = f'{name}에 대해 알려 주세요'
+            st.rerun()
+
+
 def render_assistant_extras(message, is_last, show_sources):
     meta = message.get('meta') or {}
-    pills = [INTENT_LABEL.get(meta.get('intent'), '답변'), f"{meta.get('elapsed', 0):.1f}초"]
+    timing = '저장된 답변 · 바로 표시' if meta.get('cached') else f"{meta.get('elapsed', 0):.1f}초"
+    pills = [INTENT_LABEL.get(meta.get('intent'), '답변'), timing]
     html_pills = ''.join(f'<span class="pill">{esc(p)}</span>' for p in pills)
     if meta.get('graph'):
         html_pills += '<span class="pill on">그래프 검색</span>'
@@ -509,11 +680,13 @@ def render_assistant_extras(message, is_last, show_sources):
     st.html(f'<div class="meta-row">{html_pills}</div>')
     if meta.get('unverified'):
         st.html(f'<div class="warn-note">{esc(cfg.LOW_EVIDENCE_NOTE)}</div>')
-    render_sources(meta, show_sources)
+    render_inquiry(message)
+    render_sources(meta, show_sources, message['id'])
     if meta.get('concept_map') and meta['concept_map'].get('nodes'):
         with st.expander('개념 지도 · 질문과 연결된 개념'):
             st.graphviz_chart(concept_map_dot(meta['concept_map']), width='content')
             st.html('<div class="map-legend">진한 칸: 질문에서 찾은 개념 · 연한 칸: 포함·선행·요구 같은 관계로 이어진 개념</div>')
+            concept_buttons(message, meta['concept_map'])
     if meta.get('steps'):
         render_steps(meta['steps'])
     st.feedback('thumbs', key=f"fb_{message['id']}", on_change=save_feedback, args=(message['id'],))
@@ -526,11 +699,38 @@ def render_assistant_extras(message, is_last, show_sources):
                     st.rerun()
 
 
+def answer_key(question, use_graph, agentic):
+    return (st.session_state.doc_id, ' '.join(question.split()).lower(), use_graph, agentic)
+
+
 def ask(question, use_graph, agentic):
     history = [{'role': m['role'], 'content': m['content']} for m in st.session_state.messages]
     st.session_state.messages.append({'id': uuid.uuid4().hex[:10], 'role': 'user', 'content': question})
     with st.chat_message('user'):
         st.markdown(question)
+    store, key, hit = shared(), None, None
+    if not history:                                    # 이어지는 질문은 앞 대화에 따라 답이 달라져 저장하지 않는다
+        key = answer_key(question, use_graph, agentic)
+        with store['lock']:
+            hit = store['answers'].get(key)
+            if hit is not None:
+                store['answers'].move_to_end(key)
+                store['hits'] += 1
+    if hit is not None:
+        result, elapsed = copy.deepcopy(hit['result']), hit['elapsed']
+    else:
+        result, elapsed = run_chain(question, history, use_graph, agentic)
+        if result is None:
+            return
+        if key is not None:
+            with store['lock']:
+                store['answers'][key] = {'result': copy.deepcopy(result), 'elapsed': elapsed}
+                while len(store['answers']) > cfg.ANSWER_CACHE_SIZE:
+                    store['answers'].popitem(last=False)
+    finish_answer(question, result, elapsed, use_graph, agentic, cached=hit is not None)
+
+
+def run_chain(question, history, use_graph, agentic):
     with st.chat_message('assistant', avatar=AVATAR):
         status = st.status('답변을 준비하고 있어요', expanded=True)
         ctx = get_script_run_ctx()
@@ -565,13 +765,18 @@ def ask(question, use_graph, agentic):
             st.session_state.last_error = f'답변 생성: {type(exc).__name__}: {str(exc)[:200]}'
             st.error('답변을 만들지 못했어요. 잠시 후 다시 질문해 주세요.')
             st.session_state.messages.pop()            # 실패한 질문은 대화 맥락에 남기지 않는다
-            return
+            return None, 0
+    return result, elapsed
+
+
+def finish_answer(question, result, elapsed, use_graph, agentic, cached=False):
     body, numbered, structured = format_answer(result)
     trace, agent = result['trace'], result['trace'].get('agent') or {}
     graph = st.session_state.index.graph
     cited = [s['chunk_id'] for s in numbered]
     keys = trace.get('graph_concept_keys') or []
     meta = {'intent': result.get('intent'), 'elapsed': elapsed, 'graph': use_graph, 'agentic': agentic,
+            'question': question, 'cached': cached,
             'retried': agent.get('retried', False), 'steps': agent.get('steps'), 'numbered': numbered,
             'structured': structured,
             'unverified': any(i['type'] in ('unknown_citation', 'missing_citation') for i in result.get('issues', [])),
@@ -581,7 +786,7 @@ def ask(question, use_graph, agentic):
     st.session_state.messages.append({'id': uuid.uuid4().hex[:10], 'role': 'assistant', 'content': body,
                                       'meta': meta, 'feedback': None})
     st.session_state.last_trace = {'question': question, 'trace': trace, 'issues': result.get('issues', []),
-                                   'elapsed': elapsed}
+                                   'elapsed': elapsed, 'cached': cached}
     st.rerun()                                         # 답변은 대화 기록에서 한 가지 방식으로 그린다
 
 
@@ -593,6 +798,7 @@ def export_json():
             meta = m.get('meta') or {}
             item.update({'intent': meta.get('intent'), 'elapsed_sec': round(meta.get('elapsed', 0), 1),
                          'graph': meta.get('graph'), 'agentic': meta.get('agentic'), 'feedback': m.get('feedback'),
+                         'cached': meta.get('cached', False), 'manager_inquiry': m.get('inquiry'),
                          'sources': [{'number': s['number'], 'page': s['page_start'], 'title': s['title']}
                                      for s in meta.get('numbered') or []]})
         out.append(item)
@@ -640,10 +846,19 @@ def admin_panel(configured):
             trace = last['trace']
             with st.expander('마지막 답변 추적', expanded=False):
                 st.json({'질문': last['question'], '전체(초)': round(last['elapsed'], 2),
+                         '저장된 답변 사용': last.get('cached', False),
                          '단계별(초)': trace.get('timing'),
                          '검색 결과 수': {k: len(trace.get(k, [])) for k in ('vector', 'bm25', 'graph')},
                          '찾은 개념': trace.get('graph_concepts'),
                          '검증 기록': [i['type'] for i in last['issues']]})
+        store = shared()
+        col1, col2 = st.columns([3, 2], gap='small')
+        col1.caption(f"저장된 답변 {len(store['answers'])}개 · 바로 답한 횟수 {store['hits']}")
+        if col2.button('비우기', key='clear_answers', disabled=not store['answers'], width='stretch'):
+            with store['lock']:
+                store['answers'].clear()
+                store['hits'] = 0
+            st.rerun()
         votes = [m.get('feedback') for m in st.session_state.messages if m['role'] == 'assistant']
         st.caption(f"답변 평가 · 👍 {votes.count('up')} · 👎 {votes.count('down')} · 미평가 {votes.count(None)}")
         if st.session_state.last_error:
@@ -659,23 +874,30 @@ def render_sidebar(configured):
             st.html(f'<div class="sidebar-logo">{ui_wordmark()}</div>')
             with st.container(border=True, key='document_panel'):
                 ui_heading('description', '내 백서')
-                present = st.session_state.get(f"uploader_{st.session_state.uploader_key}")
-                if present is not None and st.session_state.index is not None:
+                ready = st.session_state.index is not None
+                if ready:
                     st.html(f'''<div class="doc-card">{mi("picture_as_pdf", 26, "#e96868")}
                         <div><div class="doc-name">{esc(st.session_state.doc_name)}</div>
-                        <div class="doc-meta">{st.session_state.doc_size / 1024 / 1024:.1f} MB · PDF 백서</div></div>
+                        <div class="doc-meta">{st.session_state.doc_size / 1024 / 1024:.1f} MB · '''
+                            f'''{'기본 백서' if st.session_state.doc_source == 'default' else '올린 PDF'}</div></div>
                         <span class="doc-check">{mi("check_circle", 20, "#249b72")}</span></div>''')
                 else:
+                    if default_pdf_available():
+                        if st.button(cfg.DEFAULT_PDF_BUTTON, key='use_default', icon=':material/rocket_launch:',
+                                     type='primary', disabled=not configured, width='stretch'):
+                            with open(DEFAULT_PDF, 'rb') as f:
+                                load_document(f.read(), cfg.DEFAULT_PDF_LABEL, 'default')
+                        st.html('<div class="or-line"><span>또는 직접 올리기</span></div>')
                     st.html(f'<div class="upload-copy">{mi("upload_file", 24)}<span>PDF 백서를 올리면 바로 준비해요.'
                             f'<br>최대 {MAX_MB} MB · 글자를 읽을 수 있는 PDF</span></div>')
-                box = st.expander('문서 교체') if present is not None and st.session_state.index is not None else st.container()
+                box = st.expander('문서 교체') if ready else st.container()
                 with box:
                     uploaded = st.file_uploader('PDF 백서', type=['pdf'], label_visibility='collapsed',
                                                 key=f"uploader_{st.session_state.uploader_key}",
                                                 disabled=not configured)
                 if configured and uploaded is not None:
-                    prepare_document(uploaded)
-                elif uploaded is None and st.session_state.index is not None:
+                    load_document(uploaded.getvalue(), uploaded.name, 'upload')
+                elif uploaded is None and st.session_state.doc_source == 'upload':
                     reset_document()                   # 업로드 창에서 파일을 지우면 문서도 해제
             index = st.session_state.index
             ready = index is not None
@@ -720,8 +942,8 @@ def render_sidebar(configured):
                                    disabled=not st.session_state.messages, width='stretch',
                                    icon=':material/download:')
             admin_panel(configured)
-            st.html('<p class="ui-note">올린 문서와 대화는 이 브라우저 세션에서만 쓰고 저장하지 않아요.<br>'
-                    '서버가 다시 시작되면 문서를 다시 올려 주세요.</p>')
+            st.html('<p class="ui-note">올린 문서와 대화는 이 브라우저 세션에서만 써요. 같은 첫 질문의 답변만 '
+                    '서버 메모리에 잠시 저장해 바로 보여 드려요.<br>서버가 다시 시작되면 문서를 다시 준비해 주세요.</p>')
     return ready, use_graph, agentic, show_sources
 
 
@@ -738,7 +960,9 @@ def render_intro(configured):
                 st.html(f'<div class="topic-card-icon">{mi(icon, 24)}</div><div class="topic-card-name">{title}</div>')
                 for i, q in enumerate(questions):
                     st.button(q, key=f'topic_{key}_{i}', disabled=True, width='stretch')
-    note = ('왼쪽에서 백서 PDF를 올리면 위 질문을 누르거나 직접 질문할 수 있어요. 답변마다 백서 원문 근거를 함께 보여 드려요.'
+    start = (f"왼쪽의 '{cfg.DEFAULT_PDF_BUTTON}'을 누르거나 백서 PDF를 올리면"
+             if default_pdf_available() else '왼쪽에서 백서 PDF를 올리면')
+    note = (f'{start} 위 질문을 누르거나 직접 질문할 수 있어요. 답변마다 백서 원문 근거를 함께 보여 드려요.'
             if configured else '관리자가 API 키를 설정하면 사용할 수 있어요.')
     st.html(f'<p class="landing-note">{mi("info", 16, "#7d939e")}<span>{note}</span></p>')
 
@@ -797,7 +1021,7 @@ for i, message in enumerate(st.session_state.messages):
         if message['role'] == 'assistant':
             render_assistant_extras(message, i == len(st.session_state.messages) - 1, show_sources)
 
-prompt = st.chat_input('에이블스쿨에 대해 궁금한 점을 물어보세요' if ready else '먼저 왼쪽에서 백서 PDF를 올려 주세요',
+prompt = st.chat_input('에이블스쿨에 대해 궁금한 점을 물어보세요' if ready else '먼저 왼쪽에서 백서를 준비해 주세요',
                        disabled=not ready, max_chars=1000)
 if ready and st.session_state.pending:
     prompt, st.session_state.pending = st.session_state.pending, None
