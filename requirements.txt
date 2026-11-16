@@ -5,3 +5,4 @@ chromadb==1.5.9
 openai==3.51.0
 tiktoken==0.14.0
 pypdf==7.1.0
+ddgs>=9,<10
