@@ -625,17 +625,33 @@ def save_feedback(message_id):
             m['feedback'] = {0: 'down', 1: 'up'}.get(value)
 
 
-def make_inquiry(question, answer):
+def make_inquiry(question, answer, missing='없음'):
     """백서로 확인하지 못한 내용을 담당 매니저에게 물어볼 메시지 초안 (LLM 1회, 버튼을 눌렀을 때만)."""
     from langchain_core.output_parsers import StrOutputParser
     from langchain_core.prompts import ChatPromptTemplate
     prompt = ChatPromptTemplate.from_messages([('system', cfg.INQUIRY_SYSTEM), ('human', cfg.INQUIRY_TEMPLATE)])
-    return (prompt | rag_core.make_llm() | StrOutputParser()).invoke({'question': question, 'answer': answer}).strip()
+    return (prompt | rag_core.make_llm() | StrOutputParser()).invoke({'question': question, 'answer': answer, 'missing': missing}).strip()
+
+
+def missing_info(meta):
+    """Agentic 근거 평가가 마지막에 '부족'이라고 한 정보 (Agentic을 껐으면 빈 문자열)."""
+    grades = [s for s in meta.get('steps') or [] if s.get('node') == '근거 평가']
+    return '' if not grades or grades[-1].get('sufficient') else grades[-1].get('missing', '')
+
+
+def needs_inquiry(message):
+    """답변이 백서로 다 확인되지 않았거나, 답변 스스로 매니저 확인을 권하면 문의 초안 버튼을 보여 준다."""
+    meta = message.get('meta') or {}
+    if meta.get('intent') == 'chat':
+        return False
+    if meta.get('unverified') or meta.get('intent') == 'out_of_scope' or missing_info(meta):
+        return True
+    return any(hint in message['content'] for hint in cfg.INQUIRY_HINTS)
 
 
 def render_inquiry(message):
     meta = message.get('meta') or {}
-    if not (meta.get('unverified') or meta.get('intent') == 'out_of_scope'):
+    if not needs_inquiry(message):
         return
     if message.get('inquiry'):
         st.html(f'<div class="followup-title">{mi("edit_note", 17)}<span>매니저에게 보낼 문의 초안 · 오른쪽 위 버튼으로 복사</span></div>')
@@ -644,7 +660,8 @@ def render_inquiry(message):
     if st.button('매니저에게 물어볼 문장 만들기', key=f"inq_{message['id']}", icon=':material/edit_note:'):
         try:
             with st.spinner('문의 문장을 쓰고 있어요…'):
-                message['inquiry'] = make_inquiry(meta.get('question', ''), message['content'])
+                message['inquiry'] = make_inquiry(meta.get('question', ''), message['content'],
+                                                  missing_info(meta) or '없음')
         except Exception as exc:
             logger.exception('문의 초안 실패')
             st.session_state.last_error = f'문의 초안: {type(exc).__name__}: {str(exc)[:200]}'
