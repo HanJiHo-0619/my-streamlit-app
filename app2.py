@@ -383,6 +383,29 @@ def set_neo4j_search(enabled):
 # ----------------------------------------------------------------------------
 # 답변 가공: [n] 각주 · 출처 번호 · 개념 지도 · 후속 질문
 # ----------------------------------------------------------------------------
+SOURCE_PREFIX = re.compile(r'^\s*(?:(?P<official>공식\s*(?:안내|자료|원문|기준)|백서)|(?P<exp>선배\s*(?:후기|경험|에이블러)|선배들의\s*(?:후기|경험)))'
+                           r'\S*?\s*(?:에\s*따르면|에서는|에는|을\s*보면|를\s*보면)\s*,?\s*')
+PART_KIND = {'선배·교육생 경험': 'exp', '공식 안내': 'official', '공식 원문(부록)': 'official'}
+
+
+def fact_paragraphs(facts, by_id):
+    """사실 문장을 이어 붙이되, 같은 종류 근거가 이어지면 '공식 안내에 따르면' 같은 머리말은 처음 한 번만 남기고,
+    근거 종류(공식 ↔ 선배 경험)가 바뀌는 곳에서 문단을 나눈다. 문장 내용은 바꾸지 않는다."""
+    paragraphs, prev = [[]], None
+    for fact in facts:
+        text = fact['text'].strip()
+        m = SOURCE_PREFIX.match(text)
+        kinds = {PART_KIND.get(by_id[c].get('part')) for c in fact['citations'] if c in by_id} - {None}
+        kind = ('official' if m.group('official') else 'exp') if m else (kinds.pop() if len(kinds) == 1 else None)
+        if m and kind == prev and len(text) > m.end():
+            text = text[m.end():]
+        if kind and prev and kind != prev and paragraphs[-1]:
+            paragraphs.append([])
+        paragraphs[-1].append(text)
+        prev = kind or prev
+    return [' '.join(p) for p in paragraphs if p]
+
+
 def format_answer(result):
     """구조화 답변을 깔끔한 본문과 출처 목록으로 바꾼다. 본문에는 인용 표시를 넣지 않고, 출처는 아래 카드로 보여 준다."""
     by_id = {s['chunk_id']: s for s in result.get('sources', [])}
@@ -395,8 +418,7 @@ def format_answer(result):
         for cid in fact['citations']:
             if cid in by_id and cid not in order:
                 order.append(cid)
-    paragraphs = [' '.join(f['text'].strip() for f in facts), ' '.join(result.get('advice', [])),
-                  result.get('closing', '')]
+    paragraphs = fact_paragraphs(facts, by_id) + [' '.join(result.get('advice', [])), result.get('closing', '')]
     body = '\n\n'.join(p for p in paragraphs if p.strip())
     numbered = [{**by_id[cid], 'number': i} for i, cid in enumerate(order, 1)]
     return body, numbered, True
