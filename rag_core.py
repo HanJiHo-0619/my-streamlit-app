@@ -7,6 +7,8 @@ import os
 import re
 from dataclasses import dataclass, field
 
+RAG_CORE_VERSION = '2026-11-17.1'   # 앱이 서버에 남은 예전 모듈을 알아보는 표시 (코드를 바꾸면 올린다)
+
 FOOTER_RE = re.compile(r'^\s*AIVLE School 백서\s*·\s*\d+\s*$')
 MARK_RE = re.compile(r'</?mark>')
 HEADING_MD_RE = re.compile(r'^(#{1,6})\s+(.*)$')

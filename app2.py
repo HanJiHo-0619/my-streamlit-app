@@ -9,8 +9,11 @@
 import base64
 import hashlib
 import html
+import importlib
 import json
+import logging
 import os
+import re
 import tempfile
 import threading
 import time
@@ -21,6 +24,13 @@ from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ct
 
 import rag_core
 import ui_assets
+
+# 배포가 갱신돼도 서버 프로세스에는 예전 rag_core 모듈이 남아 있을 수 있다 → 버전이 다르면 다시 읽는다
+RAG_CORE_VERSION = '2026-11-17.1'
+if getattr(rag_core, 'RAG_CORE_VERSION', None) != RAG_CORE_VERSION:
+    rag_core = importlib.reload(rag_core)
+    ui_assets = importlib.reload(ui_assets)
+logger = logging.getLogger('aivle_app')
 
 st.set_page_config(page_title='AIVLE 학습 도우미', page_icon='📘', layout='wide', initial_sidebar_state='auto')
 
@@ -113,6 +123,9 @@ p,label,button,li{font-family:Inter,"Pretendard","Noto Sans KR","Apple SD Gothic
 [data-testid="stSidebar"] [data-testid="stFileUploader"] section{padding:8px!important;border-radius:10px;background:#edf8f6;}
 [data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"]{display:none;}
 [data-testid="stSidebar"] [data-testid="stFileUploader"] button{width:100%;font-size:12px;min-height:35px;}
+[data-testid="stFileUploaderDropzone"] button [data-testid="stMarkdownContainer"]{display:none!important;}
+[data-testid="stFileUploaderDropzone"] button span[data-has-shortcut]{display:inline-flex;align-items:center;gap:6px;}
+[data-testid="stFileUploaderDropzone"] button span[data-has-shortcut]::after{content:"PDF 파일 선택";font-size:12.5px;font-weight:600;}
 .stButton button,.stDownloadButton button{border:1px solid #d8e2e7;border-radius:11px;min-height:40px;font-weight:600;background:#fff;color:#20353e;}
 .stButton button:hover,.stDownloadButton button:hover{border-color:#5cbfb8;color:#078482;background:#f4fbfa;}
 .stButton button:disabled{opacity:.6;}
@@ -183,7 +196,6 @@ p,label,button,li{font-family:Inter,"Pretendard","Noto Sans KR","Apple SD Gothic
 .source-summary strong{color:var(--teal);font-weight:650;}
 .src-card{border:1px solid #e3ebef;border-radius:12px;padding:12px 14px;margin:6px 0 10px;background:#fff;}
 .src-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
-.src-num{width:22px;height:22px;border-radius:50%;background:var(--teal);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;}
 .badge{font-size:11px;padding:1px 8px;border-radius:999px;font-weight:650;}
 .badge.exp{background:#fff1e0;color:#b4610e;}.badge.official{background:#e4f7f4;color:#087f80;}
 .badge.appendix{background:#eef1f3;color:#5f7380;}.badge.guide{background:#f3effa;color:#6a55a0;}
@@ -281,7 +293,8 @@ def prepare_document(uploaded):
             finally:
                 os.remove(pdf_path)
         except Exception as exc:
-            st.session_state.last_error = f'문서 준비: {type(exc).__name__}'
+            logger.exception('문서 준비 실패')         # 원인은 Manage app → 로그에서 확인
+            st.session_state.last_error = f'문서 준비: {type(exc).__name__}: {str(exc)[:200]}'
             reset_document()
             status.update(label='문서를 준비하지 못했어요', state='error')
             st.error('PDF에서 글자를 읽을 수 있는지, API 설정이 맞는지 확인해 주세요.')
@@ -328,7 +341,7 @@ def set_neo4j_search(enabled):
 # 답변 가공: [n] 각주 · 출처 번호 · 개념 지도 · 후속 질문
 # ----------------------------------------------------------------------------
 def format_answer(result):
-    """구조화 답변을 [n] 각주가 붙은 본문과 번호 매긴 출처 목록으로 바꾼다 (검증 결과는 그대로 사용)."""
+    """구조화 답변을 깔끔한 본문과 출처 목록으로 바꾼다. 본문에는 인용 표시를 넣지 않고, 출처는 아래 카드로 보여 준다."""
     by_id = {s['chunk_id']: s for s in result.get('sources', [])}
     facts = result.get('facts')
     if facts is None or (not facts and not result.get('advice') and not result.get('closing')):
@@ -339,16 +352,10 @@ def format_answer(result):
         for cid in fact['citations']:
             if cid in by_id and cid not in order:
                 order.append(cid)
-    number = {cid: i for i, cid in enumerate(order, 1)}
-    lines = []
-    for fact in facts:
-        marks = ''.join(f'[{number[c]}]' for c in fact['citations'] if c in number)
-        text = fact['text'].strip()
-        mark = f' {marks}' if marks else ' (근거 확인 필요)'
-        lines.append(text[:-1] + mark + '.' if text.endswith('.') else text + mark)
-    paragraphs = [' '.join(lines), ' '.join(result.get('advice', [])), result.get('closing', '')]
+    paragraphs = [' '.join(f['text'].strip() for f in facts), ' '.join(result.get('advice', [])),
+                  result.get('closing', '')]
     body = '\n\n'.join(p for p in paragraphs if p.strip())
-    numbered = [{**by_id[cid], 'number': number[cid]} for cid in order]
+    numbered = [{**by_id[cid], 'number': i} for i, cid in enumerate(order, 1)]
     return body, numbered, True
 
 
@@ -380,6 +387,33 @@ def pick_followups(question, cited_ids, graph, limit=3):
     return picked
 
 
+MAP_NOISE = {'교육생경험', '선배경험', '공식안내', '공식원문', '문서안내', '백서', '선배후기', '공개후기'}
+TITLE_PREFIX = re.compile(r'^(PART\s*\d+\.|부록\s*[A-C]\.|[A-C]\d\.|Q\d*\.|\d+(\.\d+)*\.?)\s*')
+
+
+def title_keys(index):
+    """절·장 제목을 개념 키 모양으로 모아 둔다 (개념 지도에서 제목성 개념을 거르는 데 사용)."""
+    if getattr(index, '_title_keys', None) is None:
+        keys = set()
+        for d in index.docs:
+            for part in [d.metadata['title']] + d.metadata['section_path'].split(' > '):
+                keys.add(rag_core.concept_key(TITLE_PREFIX.sub('', part)))
+        index._title_keys = keys
+    return index._title_keys
+
+
+def tidy_concept_map(subgraph, index):
+    """질문 개념은 그대로 두고, 이웃 중 제목·문서 표기에서 나온 개념과 문장 조각을 뺀다 (그래프 데이터는 그대로)."""
+    titles = title_keys(index)
+    keep = [n for n in subgraph['nodes']
+            if n['query'] or not (n['key'] in MAP_NOISE or n['key'] in titles or len(n['key']) > 12)]
+    kept = {n['key'] for n in keep}
+    edges = [e for e in subgraph['edges'] if e['source'] in kept and e['target'] in kept]
+    linked = {e['source'] for e in edges} | {e['target'] for e in edges}
+    keep = [n for n in keep if n['query'] or n['key'] in linked]
+    return {'nodes': keep, 'edges': edges} if len(keep) >= 2 and edges else None
+
+
 def concept_map_dot(subgraph):
     def label(text):
         return text.replace('\\', '').replace('"', "'")
@@ -403,22 +437,44 @@ def esc(text):
     return html.escape(str(text or ''))
 
 
+def clean_snippet(text, limit=420):
+    """출처 미리보기: 마크다운 표는 '칸 · 칸' 줄로 바꾸고 구분선·굵게 표시·줄바꿈 태그를 지운다."""
+    lines = []
+    for line in str(text or '').splitlines():
+        s = line.strip()
+        if s.startswith('|'):
+            cells = [c.strip() for c in s.strip('|').split('|')]
+            if all(re.fullmatch(r':?-{2,}:?', c) for c in cells if c):
+                continue                                   # |---|---| 구분선
+            cells = [c for c in cells if c]
+            if cells:
+                lines.append(' · '.join(cells))
+        elif s:
+            lines.append(s)
+    out = re.sub(r'<br\s*/?>', ' ', '\n'.join(lines)).replace('**', '')
+    return out[:limit] + ('…' if len(out) > limit else '')
+
+
+def page_label(s):
+    return f"p.{s['page_start']}" + (f"-{s['page_end']}" if s['page_end'] != s['page_start'] else '')
+
+
 def render_sources(meta, show_sources):
     numbered = meta.get('numbered') or []
     if not show_sources or not numbered:
         return
-    labels = ' · '.join(f'[{s["number"]}]' for s in numbered)
-    title = '인용 근거' if meta.get('structured') else '검색 근거'
-    st.html(f'<div class="source-summary">{ui_icon("book", 19)}<span>{title}: <strong>{labels}</strong></span></div>')
+    pages = ', '.join(dict.fromkeys(page_label(s) for s in numbered))
+    title = '참고한 백서' if meta.get('structured') else '검색한 백서'
+    st.html(f'<div class="source-summary">{ui_icon("book", 19)}<span>{title} <strong>{len(numbered)}곳</strong>'
+            f' · {esc(pages)}</span></div>')
     with st.expander(f'참고 출처 자세히 보기 · {len(numbered)}개'):
         for s in numbered:
             badge, cls = PART_BADGE.get(s.get('part'), ('백서', 'guide'))
-            pages = f"p.{s['page_start']}" + (f"-{s['page_end']}" if s['page_end'] != s['page_start'] else '')
-            st.html(f'''<div class="src-card"><div class="src-head"><span class="src-num">{s["number"]}</span>
-                <span class="badge {cls}">{badge}</span><span class="src-page">{pages}</span>
+            st.html(f'''<div class="src-card"><div class="src-head">
+                <span class="badge {cls}">{badge}</span><span class="src-page">{page_label(s)}</span>
                 <span class="src-title">{esc(s.get("title"))}</span></div>
                 <div class="src-path">{esc(s.get("section_path"))}</div>
-                <div class="src-text">{esc((s.get("text") or "")[:420])}</div></div>''')
+                <div class="src-text">{esc(clean_snippet(s.get("text")))}</div></div>''')
 
 
 def render_steps(steps):
@@ -457,9 +513,9 @@ def render_assistant_extras(message, is_last, show_sources):
         html_pills += '<span class="pill on">Agentic' + (' · 재검색' if meta.get('retried') else '') + '</span>'
     st.html(f'<div class="meta-row">{html_pills}</div>')
     if meta.get('unverified'):
-        st.html('<div class="warn-note">일부 문장은 백서 근거를 확인하지 못했어요. "(근거 확인 필요)" 표시를 참고해 주세요.</div>')
+        st.html('<div class="warn-note">일부 내용은 백서에서 근거를 확인하지 못했어요. 중요한 일정·규정은 공지사항이나 담당 매니저에게 한 번 더 확인해 주세요.</div>')
     render_sources(meta, show_sources)
-    if meta.get('concept_map') and meta['concept_map']['nodes']:
+    if meta.get('concept_map') and meta['concept_map'].get('nodes'):
         with st.expander('개념 지도 · 질문과 연결된 개념'):
             st.graphviz_chart(concept_map_dot(meta['concept_map']), width='content')
             st.html('<div class="map-legend">진한 칸: 질문에서 찾은 개념 · 연한 칸: 포함·선행·요구 같은 관계로 이어진 개념</div>')
@@ -509,8 +565,9 @@ def ask(question, use_graph, agentic):
             elapsed = time.time() - start
             status.update(label=f'완료 · {elapsed:.1f}초', state='complete', expanded=False)
         except Exception as exc:
+            logger.exception('답변 생성 실패')         # 원인은 Manage app → 로그에서 확인
             status.update(label='답변을 만들지 못했어요', state='error')
-            st.session_state.last_error = f'답변 생성: {type(exc).__name__}'
+            st.session_state.last_error = f'답변 생성: {type(exc).__name__}: {str(exc)[:200]}'
             st.error('답변을 만들지 못했어요. 잠시 후 다시 질문해 주세요.')
             st.session_state.messages.pop()            # 실패한 질문은 대화 맥락에 남기지 않는다
             return
@@ -523,7 +580,8 @@ def ask(question, use_graph, agentic):
             'retried': agent.get('retried', False), 'steps': agent.get('steps'), 'numbered': numbered,
             'structured': structured,
             'unverified': any(i['type'] in ('unknown_citation', 'missing_citation') for i in result.get('issues', [])),
-            'concept_map': graph.subgraph(keys) if (use_graph and graph is not None and keys) else None,
+            'concept_map': (tidy_concept_map(graph.subgraph(keys), st.session_state.index)
+                            if (use_graph and graph is not None and keys) else None),
             'followups': pick_followups(question, cited, graph) if result.get('intent') != 'chat' else []}
     st.session_state.messages.append({'id': uuid.uuid4().hex[:10], 'role': 'assistant', 'content': body,
                                       'meta': meta, 'feedback': None})
