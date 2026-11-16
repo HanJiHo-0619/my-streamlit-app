@@ -224,6 +224,8 @@ def make_chunks(pages, source_name, chunk_tokens=500, overlap_tokens=80):
 # ==========================================================
 # 2. RAG 파이프라인 함수
 # ==========================================================
+import contextlib
+import contextvars
 import copy
 import time
 
@@ -251,6 +253,28 @@ USER_TEMPLATE = """[이전 대화]
 
 [질문]
 {input}"""
+
+
+# 진행 상황 알림: 앱이 listener를 걸어 두면 각 단계의 시작·끝을 알려 준다 (결과에는 영향 없음)
+_PROGRESS = contextvars.ContextVar('rag_progress', default=None)
+
+
+@contextlib.contextmanager
+def progress_listener(callback):
+    token = _PROGRESS.set(callback)
+    try:
+        yield
+    finally:
+        _PROGRESS.reset(token)
+
+
+def emit_progress(event, step, **info):
+    callback = _PROGRESS.get()
+    if callback is not None:
+        try:
+            callback(event, step, info)
+        except Exception:
+            pass                                  # 화면 갱신 실패가 답변을 막지 않게 한다
 
 
 class CachedEmbeddings(Embeddings):
@@ -356,6 +380,7 @@ class HybridRetriever:
                 if cid in self.by_id:
                     add(self.by_id[cid], rank, 'graph', self.graph_weight)
             trace['graph_concepts'] = self.graph.last_trace.get('concepts', [])
+            trace['graph_concept_keys'] = self.graph.last_trace.get('keys', [])
         best = sorted(ranked.values(), key=lambda item: -item[1])[:self.k]
         self.last_trace = trace
         return [doc for doc, _ in best]
@@ -478,8 +503,10 @@ def make_chain(index, *, llm=None, chat_model=None, structured=False, with_sourc
         history = x.get('history') or []
         previous = [m['content'] for m in history if m.get('role') == 'user'][-1:]
         start = time.time()
+        emit_progress('start', '근거 찾기')
         found = retriever.invoke('\n'.join(previous + [question]))   # 후속 질문은 직전 질문과 함께 검색
         trace = dict(retriever.last_trace, timing={'retrieve': round(time.time() - start, 2)})
+        emit_progress('end', '근거 찾기', sec=trace['timing']['retrieve'], found=len(found))
         return {'input': question, 'history': format_history(history),
                 'docs': found, 'context': format_docs(found), 'trace': trace}
 
@@ -491,8 +518,12 @@ def make_chain(index, *, llm=None, chat_model=None, structured=False, with_sourc
 
     def timed_generate(x):
         start = time.time()
+        if not agentic:
+            emit_progress('start', '답변 쓰기')
         result = generate(x)
         x.setdefault('trace', {}).setdefault('timing', {})['generate'] = round(time.time() - start, 2)
+        if not agentic:
+            emit_progress('end', '답변 쓰기', sec=x['trace']['timing']['generate'])
         return result
 
     answer_step = RunnableLambda(timed_generate)
@@ -972,6 +1003,7 @@ class GraphIndex:
         self.concepts = {}                 # key -> {'name','type','chunks'}
         self.neighbors = defaultdict(lambda: defaultdict(set))  # key -> 이웃 key -> 관계 종류
         q_texts, self.q_chunks = [], []
+        self.chunk_questions = {}                # 청크 ID -> 미리 만든 예상 질문 (후속 질문 추천용)
         for d in docs:
             item = items.get(d.metadata['content_hash'])
             if not item:
@@ -986,6 +1018,7 @@ class GraphIndex:
             for q in item['questions']:
                 q_texts.append(q)
                 self.q_chunks.append(cid)
+            self.chunk_questions[cid] = list(item['questions'])
         # 질문 속 표기 → 개념 키 (개념 이름 + 표준 이름의 다른 표기)
         self.surface = {k: k for k in self.concepts}
         for alias_key, canon in _ALIAS.items():
@@ -1056,9 +1089,47 @@ class GraphIndex:
                     break
                 scores[self.q_chunks[i]] += top * 0.5 / (rank + 1)
         ranked = sorted(scores, key=lambda c: -scores[c])[:limit]
-        self.last_trace = {'concepts': [self.concepts[k]['name'] for k in keys], 'backend': backend,
-                           'chunks': ranked}
+        self.last_trace = {'concepts': [self.concepts[k]['name'] for k in keys], 'keys': keys,
+                           'backend': backend, 'chunks': ranked}
         return ranked
+
+
+def _graph_questions_for(self, chunk_ids, limit=6):
+    """인용된 청크의 예상 질문을 순서대로 모은다 (중복 제거)."""
+    seen, out = set(), []
+    for cid in chunk_ids:
+        for q in self.chunk_questions.get(cid, []):
+            if q not in seen:
+                seen.add(q)
+                out.append(q)
+    return out[:limit]
+
+
+def _graph_subgraph(self, keys, max_nodes=10, per_concept=3):
+    """질문 개념과, 구체적인 관계로 이어진 이웃(개념마다 최대 3개)으로 작은 개념 지도를 만든다."""
+    keys = [k for k in keys if k in self.concepts][:3]
+    chosen, edges, seen = list(keys), [], set()
+    for key in keys:
+        neighbors = sorted(self.specific_neighbors(key), key=lambda n: -len(self.concepts[n]['chunks']))
+        for nb in neighbors[:per_concept]:
+            if len(chosen) >= max_nodes and nb not in chosen:
+                break
+            if nb not in chosen:
+                chosen.append(nb)
+    for key in keys:                                   # 간선은 질문 개념에 닿는 것만 그린다
+        for nb, types in self.neighbors.get(key, {}).items():
+            pair = tuple(sorted((key, nb)))
+            specific = sorted(types - {'관련'})
+            if nb in chosen and pair not in seen and specific:
+                seen.add(pair)
+                edges.append({'source': key, 'target': nb, 'types': specific})
+    nodes = [{'key': k, 'name': self.concepts[k]['name'], 'type': self.concepts[k]['type'], 'query': k in keys}
+             for k in chosen]
+    return {'nodes': nodes, 'edges': edges}
+
+
+GraphIndex.questions_for = _graph_questions_for
+GraphIndex.subgraph = _graph_subgraph
 
 
 def load_graph(graph_path, docs, min_coverage=0.8, use_neo4j=True, neo4j_search=True):
@@ -1240,21 +1311,26 @@ def build_agentic_chain(llm, retriever, answer_step, finish, k=5, max_docs=None)
         result = answer_step.invoke(x)
         return {'result': result, 'steps': state['steps'] + [{'node': '생성', 'docs': len(docs)}]}
 
-    def timed(node):
-        """각 단계의 소요 시간(초)을 단계 기록에 붙인다."""
+    labels = {'classify': '질문 분석', 'retrieve': '근거 찾기', 'grade': '근거 평가',
+              're_retrieve': '다시 찾기', 'generate': '답변 쓰기'}
+
+    def timed(node, name):
+        """각 단계의 소요 시간(초)을 단계 기록에 붙이고, 진행 상황을 알린다."""
         def wrapper(state):
             start = time.time()
+            emit_progress('start', labels[name])
             out = node(state)
             out['steps'][-1]['sec'] = round(time.time() - start, 2)
+            emit_progress('end', labels[name], **out['steps'][-1])
             return out
         return wrapper
 
     graph = StateGraph(AgentState)
-    graph.add_node('classify', timed(classify))
-    graph.add_node('retrieve', timed(retrieve))
-    graph.add_node('grade', timed(grade))
-    graph.add_node('re_retrieve', timed(re_retrieve))
-    graph.add_node('generate', timed(generate))
+    graph.add_node('classify', timed(classify, 'classify'))
+    graph.add_node('retrieve', timed(retrieve, 'retrieve'))
+    graph.add_node('grade', timed(grade, 'grade'))
+    graph.add_node('re_retrieve', timed(re_retrieve, 're_retrieve'))
+    graph.add_node('generate', timed(generate, 'generate'))
     graph.add_edge(START, 'classify')
     graph.add_conditional_edges('classify', lambda s: 'generate' if s['route'] == 'chat' else 'retrieve',
                                 {'generate': 'generate', 'retrieve': 'retrieve'})
