@@ -4,9 +4,12 @@
 - 색인은 세션마다 따로 만든다 (st.session_state). 다른 사용자의 업로드가 내 색인을 지우지 않는다.
 - 사전 생성 그래프는 graph_cache.json이 있으면 그것을, 없으면 Neo4j에서 청크 해시로 읽는다.
 - 화면 디자인은 팀 UI 시안(유령 캐릭터·카드형 사이드바·주제 카드)을 바탕으로 했다.
+- 답변 방식·추천 질문·화면 문구는 aivle_config.py(사람이 정하는 설정)에서 가져온다.
+- 아이콘은 Streamlit 기본 Material 아이콘, 로고·캐릭터는 assets/ 폴더의 이미지 파일을 쓴다.
 - API 키 등 비밀 값은 Streamlit Secrets에서만 읽는다.
 """
 import base64
+import functools
 import hashlib
 import html
 import importlib
@@ -22,42 +25,36 @@ import uuid
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
 
+import aivle_config
 import rag_core
-import ui_assets
 
-# 배포가 갱신돼도 서버 프로세스에는 예전 rag_core 모듈이 남아 있을 수 있다 → 버전이 다르면 다시 읽는다
-RAG_CORE_VERSION = '2026-11-17.1'
-if getattr(rag_core, 'RAG_CORE_VERSION', None) != RAG_CORE_VERSION:
-    rag_core = importlib.reload(rag_core)
-    ui_assets = importlib.reload(ui_assets)
+
+def fresh(module):
+    """배포가 갱신돼도 서버에는 예전 모듈이 남아 있을 수 있다 → 파일이 바뀌었으면 다시 읽는다."""
+    stamp = os.path.getmtime(module.__file__)
+    if getattr(module, '_loaded_mtime', None) != stamp:
+        module = importlib.reload(module)
+        module._loaded_mtime = stamp
+    return module
+
+
+aivle_config = fresh(aivle_config)      # 설정을 먼저 읽어야 rag_core가 새 설정을 가져간다
+rag_core = fresh(rag_core)
+cfg = aivle_config
 logger = logging.getLogger('aivle_app')
 
-st.set_page_config(page_title='AIVLE 학습 도우미', page_icon='📘', layout='wide', initial_sidebar_state='auto')
+st.set_page_config(page_title=cfg.APP_TITLE, page_icon='📘', layout='wide', initial_sidebar_state='auto')
 
 SECRET_KEYS = ['OPENAI_API_KEY', 'OPENAI_CHAT_MODEL', 'OPENAI_EMBEDDING_MODEL', 'NEO4J_URI',
                'NEO4J_USERNAME', 'NEO4J_PASSWORD', 'NEO4J_DATABASE', 'ADMIN_PASSWORD']
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 GRAPH_PATH = os.path.join(APP_DIR, 'graph_cache.json')
 EMBED_CACHE = os.getenv('EMBED_CACHE_DIR') or os.path.join(tempfile.gettempdir(), 'aivle_embed_cache')
-MAX_MB = 30
-AVATAR = ':material/chat_bubble_outline:'
-
-TOPICS = [
-    ('intro', 'book', '에이블스쿨 소개', ['AIVLE School은 어떤 과정인가요?', 'AI 트랙과 DX 트랙은 뭐가 달라요?',
-                                     '교육장은 어디이고 매번 가야 하나요?']),
-    ('study', 'laptop', '학습 전략', ['비전공자도 따라갈 수 있을까요?', '선배들은 어떻게 공부했나요?',
-                                  '6개월 과정인데 잘 할 수 있을까요?']),
-    ('project', 'layers', '프로젝트', ['미니프로젝트는 어떻게 진행되나요?', '빅프로젝트 팀은 어떻게 정해지나요?',
-                                   '빅프로젝트 주제는 어떻게 정하나요?']),
-    ('career', 'briefcase', '수료·취업', ['수료하려면 출석을 얼마나 해야 하나요?', '훈련장려금은 어떻게 받나요?',
-                                      '수료 후 취업 지원은 뭐가 있나요?']),
-]
-READY_QUESTIONS = [('intro', 'AI 트랙과 DX 트랙은 뭐가 달라요?'), ('study', '선배들은 어떻게 공부했나요?'),
-                   ('project', '빅프로젝트 팀은 어떻게 정해지나요?'), ('career', '수료 후 취업 지원은 뭐가 있나요?')]
-CHAT_CHIPS = [('intro', '트랙 비교', 'AI 트랙과 DX 트랙은 뭐가 달라요?'),
-              ('study', '선배 학습 전략', '선배들은 어떻게 공부했나요?'),
-              ('project', '빅프로젝트 팁', '빅프로젝트 주제는 어떻게 정하나요?'),
-              ('career', '수료·취업', '수료 후 취업 지원은 뭐가 있나요?')]
+MAX_MB = cfg.MAX_UPLOAD_MB
+AVATAR = ':material/chat:'
+ASSET_DIR = os.path.join(APP_DIR, 'assets')
+TOPICS, READY_QUESTIONS, CHAT_CHIPS = cfg.TOPICS, cfg.READY_QUESTIONS, cfg.CHAT_CHIPS
+TOPIC_ICON = {key: icon for key, icon, _title, _questions in TOPICS}
 INTENT_LABEL = {'fact': '공식·사실', 'experience': '선배 경험', 'advice': '조언',
                 'out_of_scope': '백서 밖 질문', 'chat': '인사·안내'}
 PART_BADGE = {'선배·교육생 경험': ('선배 경험', 'exp'), '공식 안내': ('공식 안내', 'official'),
@@ -67,35 +64,36 @@ PART_BADGE = {'선배·교육생 경험': ('선배 경험', 'exp'), '공식 안�
 # ----------------------------------------------------------------------------
 # 아이콘 · 로고 · 스타일
 # ----------------------------------------------------------------------------
-def svg_uri(name, color='#079e9b'):
-    svg = (f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="{color}" '
-           f'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">{ui_assets.ICONS[name]}</svg>')
-    return 'data:image/svg+xml;base64,' + base64.b64encode(svg.encode('utf-8')).decode('ascii')
+@functools.lru_cache(maxsize=None)
+def asset_uri(filename, mime):
+    """assets/ 폴더의 이미지를 data URI로 읽는다. 파일이 없으면 None (글자로 대신 표시)."""
+    path = os.path.join(ASSET_DIR, filename)
+    if not os.path.exists(path):
+        return None
+    with open(path, 'rb') as f:
+        return f'data:{mime};base64,' + base64.b64encode(f.read()).decode('ascii')
 
 
-def ui_icon(name, size=22, color='#079e9b'):
-    return (f'<img class="ui-icon" src="{svg_uri(name, color)}" width="{size}" height="{size}" '
-            f'alt="" aria-hidden="true">')
+def mi(name, size=20, color='#079e9b'):
+    """Material 아이콘 (Streamlit에 들어 있는 Material Symbols 글꼴)."""
+    return f'<span class="mi" style="font-size:{size}px;color:{color}" aria-hidden="true">{name}</span>'
 
 
 def ui_wordmark():
-    mask = f'url(data:image/png;base64,{ui_assets.LOGO_PNG_B64})'
+    logo = asset_uri('aivle_logo.png', 'image/png')
+    if logo is None:
+        return '<span class="brand-text">AIVLE</span>'
     return (f'<span class="brand-wordmark" role="img" aria-label="AIVLE" '
-            f'style="-webkit-mask-image:{mask};mask-image:{mask}"></span>')
+            f'style="-webkit-mask-image:url({logo});mask-image:url({logo})"></span>')
 
 
 def ui_ghost():
-    return (f'<img class="ghost-image" src="data:image/webp;base64,{ui_assets.GHOST_WEBP_B64}" '
-            f'alt="돋보기를 든 학습 도우미 유령">')
+    ghost = asset_uri('ghost.webp', 'image/webp')
+    return f'<img class="ghost-image" src="{ghost}" alt="돋보기를 든 학습 도우미 유령">' if ghost else ''
 
 
-def ui_heading(name, title):
-    st.html(f'<div class="panel-title">{ui_icon(name, 21, "#166a70")}<span>{title}</span></div>')
-
-
-def icon_rule(selector, name, size, color='#079e9b'):
-    return (f'{selector}::before{{content:"";display:block;width:{size}px;height:{size}px;flex:0 0 {size}px;'
-            f'background:center/{size}px no-repeat url("{svg_uri(name, color)}");}}')
+def ui_heading(icon, title):
+    st.html(f'<div class="panel-title">{mi(icon, 21, "#166a70")}<span>{title}</span></div>')
 
 
 CSS = '''
@@ -105,7 +103,9 @@ CSS = '''
 [data-testid="stMain"]{background:radial-gradient(ellipse at 100% 0%,#dff5f3 0,transparent 29%),#fcfefe;scroll-padding-bottom:130px;}
 [data-testid="stMainBlockContainer"]{max-width:1280px!important;padding:2.6rem 2rem 140px!important;}
 p,label,button,li{font-family:Inter,"Pretendard","Noto Sans KR","Apple SD Gothic Neo","Malgun Gothic",sans-serif;}
-.ui-icon{display:block;max-width:none!important;flex-shrink:0;object-fit:contain;}
+.mi{font-family:"Material Symbols Rounded";font-weight:400;font-style:normal;line-height:1;letter-spacing:normal;text-transform:none;display:inline-block;white-space:nowrap;font-feature-settings:"liga";-webkit-font-smoothing:antialiased;flex-shrink:0;}
+.brand-text{font-weight:800;letter-spacing:.06em;color:var(--teal);font-size:30px;}
+.sidebar-logo .brand-text{color:#fff;font-size:34px;}
 /* 사이드바: 카드형 패널 */
 [data-testid="stSidebar"]{background:#f3f7f8;border-right:1px solid #e8eef0;min-width:310px;max-width:350px;}
 [data-testid="stSidebarContent"]{padding:0!important;overflow-y:auto!important;}
@@ -134,12 +134,14 @@ p,label,button,li{font-family:Inter,"Pretendard","Noto Sans KR","Apple SD Gothic
 [data-testid="stSidebar"] [data-testid="stCheckbox"] label:has(input:checked)>div:first-child{background-color:var(--teal)!important;}
 [data-testid="stSidebar"] [data-testid="stCheckbox"] label:has(input:disabled){opacity:.55;}
 [class*="st-key-followups_"] .stButton button>div{justify-content:flex-start!important;}
+.st-key-ready_questions .stButton button [data-testid="stIconMaterial"],.st-key-starter_area .stButton button [data-testid="stIconMaterial"]{color:var(--teal);font-size:22px;}
+[class*="st-key-followups_"] .stButton button [data-testid="stIconMaterial"]{color:var(--teal);}
 .doc-card{display:flex;align-items:center;gap:10px;border:1px solid #e3e9ed;background:#fafcfd;border-radius:12px;padding:12px;}
 .doc-name{font-size:12px;font-weight:650;line-height:1.55;overflow-wrap:anywhere;}.doc-meta{font-size:11px;color:#80909b;margin-top:3px;}.doc-check{margin-left:auto;}
 .upload-copy{display:flex;align-items:center;gap:10px;font-size:12px;line-height:1.7;color:#617985;}
 .status-card{display:flex;gap:10px;padding:12px;border-radius:11px;background:#e5f7f3;}.status-card.waiting{background:#f0f5f7;}
 .status-dot{background:#249b72;border-radius:50%;width:19px;height:19px;display:flex;align-items:center;justify-content:center;flex:0 0 19px;margin-top:2px;}.waiting .status-dot{background:#8ba0aa;}
-.status-dot .ui-icon{filter:brightness(0) invert(1);}
+.status-dot .mi{color:#fff!important;}
 .status-title{font-size:13px;font-weight:700;margin-bottom:4px;}.status-copy{font-size:11px;line-height:1.7;color:#5b707c;overflow-wrap:anywhere;}
 .ui-api-note{font-size:11px;line-height:1.7;color:#856b2e;background:#fff8e9;border:1px solid #f0e5cc;border-radius:10px;padding:11px;}
 .ui-note{font-size:10px!important;line-height:1.65!important;color:#8a9aa4;margin:0 2px!important;}
@@ -185,7 +187,7 @@ p,label,button,li{font-family:Inter,"Pretendard","Noto Sans KR","Apple SD Gothic
 [data-testid="stChatMessage"]:has([data-testid="stChatMessageAvatarUser"]) [data-testid="stChatMessageContent"]{background:#e0f6f3;border-color:#e0f6f3;box-shadow:none;flex-grow:0;padding:12px 19px;}
 [data-testid="stChatMessageAvatarUser"]{background:#e0f4f0;color:#459d91;}
 [data-testid="stChatMessageAvatarCustom"]{width:39px;height:39px;flex:0 0 39px;border-radius:50%;background:#0ca59f;display:flex;align-items:center;justify-content:center;}
-[data-testid="stChatMessageAvatarCustom"]>*{display:none!important;}
+[data-testid="stChatMessageAvatarCustom"] *{color:#fff!important;}
 [data-testid="stChatMessageContent"] [data-testid="stExpander"]{border:1px solid #e8eff1;border-radius:12px;background:#fcfefe;margin-top:6px;}
 [data-testid="stChatMessageContent"] [data-testid="stExpander"] summary{color:#188787;font-size:12.5px;}
 .meta-row{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;}
@@ -229,14 +231,7 @@ p,label,button,li{font-family:Inter,"Pretendard","Noto Sans KR","Apple SD Gothic
 
 
 def inject_css():
-    rules = [icon_rule('[data-testid="stChatMessageAvatarCustom"]', 'chat', 23, '#ffffff').replace('::before', '::after'),
-             icon_rule('.st-key-reset_chat button', 'refresh', 15, '#4d6670'),
-             icon_rule('.st-key-release_document button', 'unlink', 15, '#4d6670')]
-    for key, icon, _title, _questions in TOPICS:
-        rules.append(icon_rule(f'.st-key-chip_{key} button', icon, 21))
-        rules.append(icon_rule(f'.st-key-ready_{key} button', icon, 25))
-    rules.append(icon_rule('[class*="st-key-followups_"] .stButton button', 'sparkles', 14))
-    st.html('<style>' + CSS + '\n'.join(rules) + '</style>')
+    st.html('<style>' + CSS + '</style>')
 
 
 # ----------------------------------------------------------------------------
@@ -250,8 +245,8 @@ def load_settings():
         values = {}
     for key, value in values.items():
         os.environ[key] = str(value)
-    os.environ.setdefault('OPENAI_CHAT_MODEL', 'gpt-6-luna')
-    os.environ.setdefault('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-large')
+    os.environ.setdefault('OPENAI_CHAT_MODEL', cfg.CHAT_MODEL)
+    os.environ.setdefault('OPENAI_EMBEDDING_MODEL', cfg.EMBEDDING_MODEL)
     return bool(os.getenv('OPENAI_API_KEY'))
 
 
@@ -465,7 +460,7 @@ def render_sources(meta, show_sources):
         return
     pages = ', '.join(dict.fromkeys(page_label(s) for s in numbered))
     title = '참고한 백서' if meta.get('structured') else '검색한 백서'
-    st.html(f'<div class="source-summary">{ui_icon("book", 19)}<span>{title} <strong>{len(numbered)}곳</strong>'
+    st.html(f'<div class="source-summary">{mi("menu_book", 19)}<span>{title} <strong>{len(numbered)}곳</strong>'
             f' · {esc(pages)}</span></div>')
     with st.expander(f'참고 출처 자세히 보기 · {len(numbered)}개'):
         for s in numbered:
@@ -513,7 +508,7 @@ def render_assistant_extras(message, is_last, show_sources):
         html_pills += '<span class="pill on">Agentic' + (' · 재검색' if meta.get('retried') else '') + '</span>'
     st.html(f'<div class="meta-row">{html_pills}</div>')
     if meta.get('unverified'):
-        st.html('<div class="warn-note">일부 내용은 백서에서 근거를 확인하지 못했어요. 중요한 일정·규정은 공지사항이나 담당 매니저에게 한 번 더 확인해 주세요.</div>')
+        st.html(f'<div class="warn-note">{esc(cfg.LOW_EVIDENCE_NOTE)}</div>')
     render_sources(meta, show_sources)
     if meta.get('concept_map') and meta['concept_map'].get('nodes'):
         with st.expander('개념 지도 · 질문과 연결된 개념'):
@@ -523,10 +518,10 @@ def render_assistant_extras(message, is_last, show_sources):
         render_steps(meta['steps'])
     st.feedback('thumbs', key=f"fb_{message['id']}", on_change=save_feedback, args=(message['id'],))
     if is_last and meta.get('followups'):
-        st.html(f'<div class="followup-title">{ui_icon("sparkles", 15)}<span>이어서 물어보기</span></div>')
+        st.html(f'<div class="followup-title">{mi("auto_awesome", 15)}<span>이어서 물어보기</span></div>')
         with st.container(key=f"followups_{message['id']}"):
             for i, q in enumerate(meta['followups']):
-                if st.button(q, key=f"fu_{message['id']}_{i}", width='stretch'):
+                if st.button(q, key=f"fu_{message['id']}_{i}", icon=':material/subdirectory_arrow_right:', width='stretch'):
                     st.session_state.pending = q
                     st.rerun()
 
@@ -606,7 +601,7 @@ def export_json():
 
 def admin_panel(configured):
     with st.container(border=True, key='admin_panel'):
-        ui_heading('settings', '관리자')
+        ui_heading('admin_panel_settings', '관리자')
         password = os.getenv('ADMIN_PASSWORD')
         if not password:
             st.caption('ADMIN_PASSWORD가 설정되지 않아 관리자 영역을 쓸 수 없어요.')
@@ -663,15 +658,15 @@ def render_sidebar(configured):
         with st.container(key='sidebar_stack'):
             st.html(f'<div class="sidebar-logo">{ui_wordmark()}</div>')
             with st.container(border=True, key='document_panel'):
-                ui_heading('file', '내 백서')
+                ui_heading('description', '내 백서')
                 present = st.session_state.get(f"uploader_{st.session_state.uploader_key}")
                 if present is not None and st.session_state.index is not None:
-                    st.html(f'''<div class="doc-card">{ui_icon("file", 24, "#e96868")}
+                    st.html(f'''<div class="doc-card">{mi("picture_as_pdf", 26, "#e96868")}
                         <div><div class="doc-name">{esc(st.session_state.doc_name)}</div>
                         <div class="doc-meta">{st.session_state.doc_size / 1024 / 1024:.1f} MB · PDF 백서</div></div>
-                        <span class="doc-check">{ui_icon("check", 18, "#249b72")}</span></div>''')
+                        <span class="doc-check">{mi("check_circle", 20, "#249b72")}</span></div>''')
                 else:
-                    st.html(f'<div class="upload-copy">{ui_icon("book", 22)}<span>PDF 백서를 올리면 바로 준비해요.'
+                    st.html(f'<div class="upload-copy">{mi("upload_file", 24)}<span>PDF 백서를 올리면 바로 준비해요.'
                             f'<br>최대 {MAX_MB} MB · 글자를 읽을 수 있는 PDF</span></div>')
                 box = st.expander('문서 교체') if present is not None and st.session_state.index is not None else st.container()
                 with box:
@@ -686,37 +681,37 @@ def render_sidebar(configured):
             ready = index is not None
             graph_ok = ready and index.graph is not None
             with st.container(border=True, key='answer_settings'):
-                ui_heading('settings', '답변 설정')
+                ui_heading('tune', '답변 설정')
                 use_graph = st.toggle('그래프 검색', value=graph_ok, disabled=not graph_ok,
                                       help='질문 속 개념과 관계로 이어진 절을 함께 찾아요. 사전 그래프가 있는 백서에서만 켤 수 있어요.')
                 agentic = st.toggle('Agentic (근거 평가·재검색)', value=False,
                                     help='근거가 부족하면 다시 찾아요. 질문마다 몇 초 더 걸려요.')
                 show_sources = st.toggle('참고 출처 표시', value=True, help='답변 아래 근거 카드를 보여 줘요.')
             with st.container(border=True, key='document_status'):
-                ui_heading('chart', '현재 상태')
+                ui_heading('monitoring', '현재 상태')
                 if not configured:
                     st.html('<div class="ui-api-note"><strong>API 설정이 필요해요</strong><br>'
                             '관리자가 Streamlit Secrets에 OPENAI_API_KEY를 설정하면 사용할 수 있어요.</div>')
                 elif not ready:
-                    st.html(f'<div class="status-card waiting"><span class="status-dot">{ui_icon("file", 13)}</span>'
+                    st.html(f'<div class="status-card waiting"><span class="status-dot">{mi("hourglass_empty", 13)}</span>'
                             '<div><div class="status-title">문서를 기다리고 있어요</div>'
                             '<div class="status-copy">PDF 백서를 올리면 바로 질문할 수 있어요.</div></div></div>')
                 else:
                     info = index.graph_info
                     graph_line = (f"그래프 개념 {info['concepts']:,}개 · {'Neo4j' if info.get('source') == 'neo4j' else 'JSON'}"
                                   if graph_ok else '사전 그래프 없음 · 기본 검색으로 답해요')
-                    st.html(f'<div class="status-card"><span class="status-dot">{ui_icon("check", 13)}</span>'
+                    st.html(f'<div class="status-card"><span class="status-dot">{mi("check", 14)}</span>'
                             f'<div><div class="status-title">문서 준비 완료</div><div class="status-copy">'
                             f'{index.pages}쪽 · 청크 {len(index.docs)}개<br>{esc(graph_line)}</div></div></div>')
             with st.container(border=True, key='management_panel'):
-                ui_heading('layers', '관리')
+                ui_heading('folder_managed', '관리')
                 col1, col2 = st.columns(2, gap='small')
-                if col1.button('대화 초기화', key='reset_chat', disabled=not st.session_state.messages,
+                if col1.button('대화 초기화', key='reset_chat', icon=':material/refresh:', disabled=not st.session_state.messages,
                                width='stretch'):
                     st.session_state.messages = []
                     st.session_state.last_trace = None
                     st.rerun()
-                if col2.button('문서 변경', key='release_document', disabled=not ready, width='stretch'):
+                if col2.button('문서 변경', key='release_document', icon=':material/swap_horiz:', disabled=not ready, width='stretch'):
                     reset_document()
                     st.session_state.uploader_key += 1          # 업로드 창을 비운다
                     st.rerun()
@@ -732,32 +727,31 @@ def render_sidebar(configured):
 
 def render_intro(configured):
     st.html(f'''<section class="intro-hero"><div class="intro-copy"><span class="intro-eyebrow">AIVLE School</span>
-        <div class="intro-title" role="heading" aria-level="1">AIVLE 학습 도우미</div>
-        <p class="intro-description">에이블스쿨 백서를 근거로 과정 · 학습 · 프로젝트 · 수료와 취업까지<br>
-        궁금한 내용을 찾아 드리고, 공부와 진로 고민에는 따뜻한 조언도 함께 드려요.</p></div>
+        <div class="intro-title" role="heading" aria-level="1">{cfg.APP_TITLE}</div>
+        <p class="intro-description">{cfg.INTRO_DESCRIPTION}</p></div>
         <div class="intro-art" aria-hidden="true">{ui_ghost()}</div></section>''')
-    st.html(f'<div class="landing-section-title">{ui_icon("sparkles", 21)}<span>이런 질문을 해 보세요!</span></div>')
+    st.html(f'<div class="landing-section-title">{mi("auto_awesome", 21)}<span>이런 질문을 해 보세요!</span></div>')
     with st.container(key='intro_cards'):
         cols = st.columns(4, gap='medium')
         for col, (key, icon, title, questions) in zip(cols, TOPICS):
             with col, st.container(border=True, key=f'topic_card_{key}'):
-                st.html(f'<div class="topic-card-icon">{ui_icon(icon, 24)}</div><div class="topic-card-name">{title}</div>')
+                st.html(f'<div class="topic-card-icon">{mi(icon, 24)}</div><div class="topic-card-name">{title}</div>')
                 for i, q in enumerate(questions):
                     st.button(q, key=f'topic_{key}_{i}', disabled=True, width='stretch')
     note = ('왼쪽에서 백서 PDF를 올리면 위 질문을 누르거나 직접 질문할 수 있어요. 답변마다 백서 원문 근거를 함께 보여 드려요.'
             if configured else '관리자가 API 키를 설정하면 사용할 수 있어요.')
-    st.html(f'<p class="landing-note">{ui_icon("book", 16, "#7d939e")}<span>{note}</span></p>')
+    st.html(f'<p class="landing-note">{mi("info", 16, "#7d939e")}<span>{note}</span></p>')
 
 
 def render_ready():
     st.html('<header class="ready-header"><div class="ready-title" role="heading" aria-level="1">무엇이 궁금하세요?</div>'
-            '<p class="ready-description">올린 백서를 근거로 답하고, 답변마다 쪽 번호와 원문을 함께 보여 드려요.</p></header>')
-    st.html(f'<div class="landing-section-title">{ui_icon("sparkles", 21)}<span>많이 찾는 질문</span></div>')
+            f'<p class="ready-description">{cfg.READY_DESCRIPTION}</p></header>')
+    st.html(f'<div class="landing-section-title">{mi("auto_awesome", 21)}<span>많이 찾는 질문</span></div>')
     with st.container(key='ready_questions'):
         for start in (0, 2):
             cols = st.columns(2, gap='medium')
             for col, (key, q) in zip(cols, READY_QUESTIONS[start:start + 2]):
-                if col.button(q, key=f'ready_{key}', width='stretch'):
+                if col.button(q, key=f'ready_{key}', icon=f':material/{TOPIC_ICON[key]}:', width='stretch'):
                     st.session_state.pending = q
                     st.rerun()
     with st.expander('주제별 질문 더 보기'):
@@ -777,7 +771,7 @@ def render_chat_header():
         cols = st.columns(4, gap='small')
         for col, (key, label, q) in zip(cols, CHAT_CHIPS):
             with col, st.container(key=f'chip_{key}'):
-                if st.button(label, key=f'chipbtn_{key}', width='stretch', help=q):
+                if st.button(label, key=f'chipbtn_{key}', icon=f':material/{TOPIC_ICON[key]}:', width='stretch', help=q):
                     st.session_state.pending = q
                     st.rerun()
 
